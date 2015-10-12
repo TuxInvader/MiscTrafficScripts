@@ -1,0 +1,23 @@
+#=-Version 1.1 (libQueue Release)
+import libQueue as queue;
+
+$config=[];
+$houseKeeping=[];
+$counters=[];
+
+queue.init($config, $houseKeeping, $counters);
+
+# =====================================================================
+# == Configuration Overrides for this host 
+$config["poolName"] = "Rainbow";
+$config["queueName"] = "RainbowQueue";
+$config["waitingRoomTemplatePage"] = "waitingroom.html";
+$config["waitingRoomTooBusyPage"] = "toobusy.html";
+# =====================================================================
+
+$pool = queue.do_req($config,$houseKeeping,$counters);
+if ($pool == $config["poolName"] ) {
+   pool.use("www.demo.local");
+} else {
+   pool.use("WaitingRoom");
+}
