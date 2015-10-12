@@ -1,0 +1,505 @@
+# Session Cookie Name
+$cookieName = "StingraySession";
+
+# Secret for the cookies
+$cookieSecret = "PaulwasHereOK";
+
+# Initial Session Timeout in seconds - limit possibility of DoS by setting the initial session timeout low.
+# We switch to the normal session timeout once a session has been reused.
+$sessionTimeoutInit = 10;
+
+# Session idle timeout in seconds.
+$sessionTimeout = 120;
+
+# Ignored Content Types
+$ignoredTypes = "\\.(css|png|jpg|gif|js)$";
+
+# loaded threshold for Standard Application. New users sent to High Volume,
+# returning "VIP" users get exclusive access to Standard Application
+$loadedStandard = 1000;
+
+# Busy limit for Standard Web Application. returning "VIP" users sent busy page
+$busyStandard = 1750;
+
+# Busy limit for High Volume Application. New users sent busy page
+$busyHighVolume = 3000;
+
+# Returning "VIP" User identifier - In this case a Query String
+$returningQS = "customerType=RETURNING";
+
+#==============================================================================
+# All of the HousKeeping Settings below are applied by each child for each pool
+#
+# When the number of tracked sessions exceeds the $houseKeepingBusy threshold,
+# we run housekeeping on every request, but only process a maximum of
+# $houseKeepingMax sessions per request.
+#==============================================================================
+
+# Maximum sessions to check during a house keeping run
+$houseKeepingMax = 200;
+
+# House keeping frequency (every n requests) when load is below the busy threshold.
+$houseKeepingFreq = 10;
+
+# Busy threshold for house keeping - below this we only do housekeeeping every $houseKeepingFreq requests.
+$houseKeepingBusy = 150;
+
+#==============================================================================
+# User 64bit Counters
+#==============================================================================
+
+# Counters for new, updated, and expired sessions
+$counterSessionNew = 1;
+$counterSessionUpdate = 2;
+$counterSessionExpire = 3;
+
+# Counters for Concurrent sessions for Standard and High Volume users
+$counterStandardSessions = 4;
+$counterHighVolumeSessions = 5;
+
+# Counters for Busy Pages Sent
+$counterStandardBusy = 6;
+$counterHighVolumeBusy = 7;
+
+#==============================================================================
+# Debug function. Set Debug level (0 to 4) to log information from the script.
+# 0 (zero) will only log errors. Level 1 is the least and Level 4 is the most
+# verbose.
+#==============================================================================
+sub debug($level, $string) {
+   
+   # SET THE DEBUG LEVEL HERE!!
+   $debug = 0;
+   
+   if ( $level == 0 ) {
+      log.warn("ERR: " . sys.getPid() . " " . $level . "-> " . $string);
+   } else if ( $debug >= $level ) {
+      log.info("DBG: " . sys.getPid() . " " . $level . "-> " . $string);
+   }
+      
+}
+
+#==============================================================================
+# Pool selection - Modify the pool.use() lines to use the actual name of your
+# Standard and HighVolume pools.
+#==============================================================================
+sub usePool($pool) {
+   if ( $pool == "Standard" ) {
+      
+      # Standard Application Pool name
+      pool.select("Standard");
+      
+   } else if ( $pool == "HighVolume" ) {
+      
+      # High Volume Application Pool name
+      pool.select("HoldingPool");
+      
+   } else {
+      debug(0, "usePool was given an unknown pool: " . $pool);
+      returnPage("500 Internal Server Error", "fail.html", "", "");
+   }
+}
+
+
+#==============================================================================
+#==============================================================================
+
+                       ###  DO NOT MODIFY BELOW HERE ###
+
+#==============================================================================
+#==============================================================================
+
+
+# Return the pids of all the stingray children (which have handled traffic)
+sub getChildren($mypid) {  
+   
+   $pidlist = [];
+   
+   $children = data.get("StingrayPIDS");
+   if ( ! $children ) {
+      data.set("StingrayPIDS", $mypid);
+      array.push($pidlist, $mypid);
+      debug(1,"First Child: " . $mypid . " added to pidlist");
+   } else {
+      $pidlist = string.split( $children, "," );
+      if ( ! array.contains( $pidlist, $mypid ) ) {
+         debug(1,"New Child: " . $mypid . " added to pidlist");
+         data.set("StingrayPIDS", $children . "," . $mypid);
+         array.push($pidlist, $mypid);
+      }
+   }  
+   debug(3, "PIDS: " . lang.dump($pidlist));
+   return $pidlist;  
+}
+
+# Count up all of the active sessions known by the child processes.
+sub countMeUpScotty($pidlist, $pool) {
+   
+   $count = 0;
+   foreach ( $pid in $pidlist ) {
+      $childCount = data.get("Counter." . $pool . "." .$pid);
+      debug(2, "Child: " . $pid . " Has: " . $childCount . " concurrent sessions for " . $pool);
+      if ( $childCount ) {
+         $count += $childCount;
+      }
+   }
+   debug(1, "TotalCount: " . $pool . ", " . $count);
+   return $count;
+}
+
+# Remove stale sessions and update our counter in global memory
+sub houseKeeping($mypid, $sessionTimeout, $houseKeepingMax, $houseKeepingFreq,
+                 $houseKeepingBusy, $counterSessionExpire, $counterStandardSessions, $counterHighVolumeSessions) {
+   
+   $time = sys.time();
+   $sessionsStandard = data.local.get("mySessions.Standard");
+   $sessionsHighVolume = data.local.get("mySessions.HighVolume");
+  
+   debug(2, "Starting HouseKeeping");  
+   
+   $sessionsStandard = string.split($sessionsStandard, ",");
+   $sessionsHighVolume = string.split($sessionsHighVolume, ",");
+   
+   $hkCounter = data.local.get("HouseKeepingCounter");
+   $hkCounter++;
+   data.local.set("HouseKeepingCounter", $hkCounter);
+   
+   $force = false;
+   if ( ( ( $hkCounter % $houseKeepingFreq ) == 1 ) ) {
+      # Do a run everytime our modulo returns 1. This ensures we set up counters on first run of a child
+      debug(2,"HouseKeeping: " . $houseKeepingFreq . " requests have passed since last run. Forcing run");
+      $force = true;
+   } else if ( sys.time() - data.local.get("HouseKeepingLastRun") >= $sessionTimeout ) {
+      # If it's been longer than a session timeout since we last ran, force a run.
+      debug(2,"HouseKeeping: " . $sessionTimeout . " seconds have passed since last run. Forcing run");
+      $force = true;
+      # We're forcing a run, so reset the HouseKeepingCounter to 2.
+      data.local.set("HouseKeepingCounter",2);
+   }
+   
+   if ( ( array.length($sessionsStandard) > $houseKeepingBusy ) || $force ) {
+      # Perform housekeeping
+      debug(2,"HouseKeeping: Processing Standard. Old Count: " . array.length($sessionsStandard));
+      debug(3, "Sessions for HouseKeeping: Standard: " . lang.dump($sessionsStandard)  );   
+      doHouseKeeping($sessionsStandard, $houseKeepingMax, $counterSessionExpire);
+      data.local.set("mySessions.Standard", array.join($sessionsStandard,",") );
+      data.local.set("HouseKeepingLastRun", sys.time() );
+      debug(2, "HouseKeeping:  Standard processed. New Count: " . array.length($sessionsStandard) );  
+   }
+   
+   if ( ( array.length($sessionsHighVolume) > $houseKeepingBusy ) || $force ) {
+      # Perform housekeeping
+      debug(2,"HouseKeeping: Processing High Volume. Old Count: " . array.length($sessionsHighVolume) );
+      debug(3, "Sessions for HouseKeeping: HighVolume: " . lang.dump($sessionsHighVolume)  );     
+      doHouseKeeping($sessionsHighVolume, $houseKeepingMax, $counterSessionExpire);
+      data.local.set("mySessions.HighVolume", array.join($sessionsHighVolume,",") );
+      data.local.set("HouseKeepingLastRun", sys.time() );
+      debug(2, "HouseKeeping:  High Volume processed. New Count: " . array.length($sessionsHighVolume) );
+   }
+   
+   $arrayLengthStandard = array.length($sessionsStandard);
+   $arrayLengthHighVolume = array.length($sessionsHighVolume);
+   debug(3, "Counters Updated: Standard: " . $arrayLengthStandard . ", High Volume: " . $arrayLengthHighVolume);
+   data.set("Counter.Standard." .$mypid, $arrayLengthStandard );
+   data.set("Counter.HighVolume." .$mypid, $arrayLengthHighVolume);   
+   
+   # Update the user counters at most once/second
+   if ( $time != data.local.get("CounterIncrementTime") ) {
+      debug(4, "Updating user counters for concurrent sessions");
+      counter64.increment($counterStandardSessions, $arrayLengthStandard );
+      counter64.increment($counterHighVolumeSessions, $arrayLengthHighVolume );
+      data.local.set("CounterIncrementTime", $time);
+   }
+   
+   debug(2, "HouseKeeping: Finished");
+}
+
+# The housekeeping function has determined housekeeping is necessary. So do it!
+sub doHouseKeeping($sessions, $houseKeepingMax, $counterSessionExpire) {
+
+   $newSessions = [];
+   $processed = 0;
+   $time = sys.time();
+   
+   while ( $session = array.shift($sessions) ) {
+      
+      $data = data.get("Session.". $session);
+      debug(3, "HousKeeping - Checking Session: " . $session . ": " . $data );
+      if ( ! $data ) {
+         # Hmmm we've lost our session???
+         debug( 0, "HouseKeeping - Session I'm looking after has been abducted by aliens! Session: " . $session);
+      } else {
+         debug( 3, "HouseKeeping - Session time remaining: " . $data - $time );
+         if ( $data > $time ) {
+            debug(3, "HouseKeeping - Keeping Session: " . $session);
+            array.push($newSessions , $session);
+         } else {
+            debug(3, "HouseKeeping - Removing Session: " . $session);
+            data.remove("Session.".$session);
+            counter64.increment($counterSessionExpire);
+         }
+      }
+      
+      $processed++;
+      if ( $processed >= $HouseKeepingMax ) {
+         debug(3, "HouseKeeping: " . $processed . " Sessions processed.");
+         break;
+      }
+      
+   }
+
+   array.append($sessions, $newSessions);
+   return $sessions;
+}
+
+# Check session is still valid, return CookieArray or empty string if invalid
+sub checkCookie($cookieSecret, $cookieName) {
+   $time = sys.time();
+   $ip = request.getRemoteIP();
+   $cookie = http.getCookie($cookieName);
+   $cookieString = string.decrypt($cookie, $cookieSecret);
+   $cookieArray = string.split($cookieString);
+   
+   debug(3, "Check Cookie. Session: " . lang.dump($cookieArray));
+   
+   # Store the original url for expired link
+   connection.data.set("TEMPLATE_LINK", $cookieArray[4]);
+   
+   if ( $cookieArray[1] < $time ) {
+      return "";
+   }
+   if ( $cookieArray[2] != $ip ) {
+      return "";
+   }
+   
+   return $cookieArray;
+}
+
+
+# update the cookie for the user
+sub updateCookie($cookieSecret, $cookieName, $cookieArray, $sessionTimeout) {
+   $timeout = sys.time() + $sessionTimeout;
+   $cookieArray[1] = $timeout;
+   $cookieString = array.join($cookieArray);
+   
+   debug(3, "Update Cookie. Session: " . lang.dump($cookieArray));
+   
+   # Check to see if the session exists in memory... If not add it and take responsibility for housekeeping
+   $session = data.get("Session.".$cookieArray[0]);
+   if ( ! $session ) {
+      
+      debug(2, "Untracked Session: " . $cookieArray[0] . " - User migrated from another active Stingray or software restart?");
+      
+      # This session must have been created on a different STM or we were restarted.
+      # Check the sessions we have for the pool
+      $mySessions = data.local.get("mySessions.".$cookieArray[3]);
+      if ( ! $mySessions ) {
+         # This is this childs first sessions for this pool
+         data.local.set("mySessions.".$cookieArray[3], $cookieArray[0]);
+      } else if ( string.contains($mySessions, $cookieArray[0] ) ) {
+         # Session already in list (shouldn't happen)
+         debug(0,"Odd... I'm already looking after a session I don't know about?? Session: " . lang.dump($cookieArray) );
+      } else {
+         # Add the session to this childs housekeeping list
+         data.local.set("mySessions.".$cookieArray[3], $mySessions . "," . $cookieArray[0]);
+      }
+   }
+   
+   data.set("Session.".$cookieArray[0], $timeout );
+   
+   $cookieCrypted = string.encrypt( $cookieString, $cookieSecret );   
+   http.setResponseCookie($cookieName, $cookieCrypted, "path=/; HttpOnly");
+}
+
+# Generate new session and cookie for new user
+sub issueCookie($cookieSecret, $cookieName, $sessionTimeoutInit, $pool) {
+   
+   # Generate Unique Session ID using timestamp, Client IP, Port and random digit
+   $timeout = sys.time() + $sessionTimeoutInit ;
+   $hires = sys.time.highres();
+   $ip = request.getRemoteIP();
+   $port = request.getRemotePort();
+   $rawUrl = http.getRawUrl();
+   
+   $cookieSessionTxt =  sprintf("SESS_%f_%s:%d", $hires, $ip, $port);
+   $cookieSession = string.base64Encode( string.hashSHA1( $cookieSessionTxt ) );
+   debug(3, "Generated Session Key: " . $cookieSession . " from: " . $cookieSessionTxt);
+   
+   # Add this session to this childs housekeeping list.
+   $mySessions = data.local.get("mySessions.".$pool);
+   if ( $mySessions ) {
+      data.local.set("mySessions.".$pool, $mySessions . "," . $cookieSession);
+   } else {
+      data.local.set("mySessions.".$pool, $cookieSession);
+   }
+   
+   # Create the cookieArray and store the session timeout in global memory
+   $cookieArray = [ $cookieSession, $timeout, request.getRemoteIP(), $pool , $rawUrl ];
+   $cookieString = array.join($cookieArray);
+   data.set("Session.".$cookieSession, $timeout);
+   
+   # Encrypt and set the response cookie
+   $cookieCrypted = string.encrypt( $cookieString, $cookieSecret );   
+   http.setResponseCookie($cookieName, $cookieCrypted, "path=/; HttpOnly");
+   
+   debug(2, "Issue Cookie. Session: " . lang.dump($cookieArray));
+}
+
+# Select pool based on load and customer type
+sub selectPool($returning, $pidlist, $loadedStandard, $busyStandard, $busyHighVolume, $counterStandardBusy, $counterHighVolumeBusy) {
+
+   # Count standard users
+   $countStandard = countMeUpScotty($pidlist, "Standard");
+   
+   # If the count is less than the loaded threshold, then all users get standard
+   if ( $countStandard <= $loadedStandard ) {
+      return "Standard";
+   }
+   
+   # else we're over the loaded threshold, so check for a returning user
+   else if ( $returning ) {
+      
+      # If we're returning and below the busy threshold for standard, send them to standard
+      if ( $countStandard < $busyStandard ) {
+         return "Standard";
+      }
+      # Oh dear, we're too busy. Send the standard too busy page
+      else {
+         debug(3, "User Sent to Busy page for Standard pool");
+         counter64.increment( $counterStandardBusy );
+         returnPage("503 Server Busy", "standard.html", "", "");
+      }
+      
+   }
+   
+   # we're a new user not a retuning one, check the high volume pool
+   else {
+      $countHighVolume = countMeUpScotty($pidlist, "HighVolume");
+      
+      # if HighVolume is not too busy then send the user there
+      if ( $countHighVolume <= $busyHighVolume ) {
+         return "HighVolume";
+      }
+      # oh dear, we're too busy. Send the highvolume too busy page
+      else {
+         debug(3, "User Sent to Busy page for High Volume pool");
+         counter64.increment( $counterHighVolumeBusy );
+         returnPage("503 Server Busy", "highvolume.html", "", "");
+      }
+   }
+}
+
+
+# Send a page back to the user directly. Check for resource on disk, fall back to a default message if missing
+sub returnPage($code, $resource, $headers, $link) {
+   debug(1, "STM sending page to user: " . $code . " - " . $resource);
+   if ( resource.exists($resource) ) {
+      $resource = resource.get($resource);
+   } else {
+      debug(1, "returnPage resource not found: " . $resource . ". Default Page Delivered");
+      $resource = "<html><head><title>Too  Busy</title></head><body><h1>Sorry, we're too  busy</h1><p>Please try  later...</p></body></html>\r\n";
+   }
+   
+   # put the correct link into the resource page if we have one
+   if ( $link ) {
+      $resource = string.replaceAll($resource, "TEMPLATE_LINK", $link);
+   }
+   
+   # ensure STM responses are uncacheable.
+   $headers = "Cache-Control: private, max-age=0\r\n" . $headers;
+   http.sendResponse($code, "text/html", $resource, $headers);
+}
+
+########################
+### MAIN CODE BLOCK ####
+########################
+
+# Create this childs identifier
+$mypid = "PID." . sys.getPid();
+
+# Get the child pids
+$pidlist = getChildren($mypid);
+
+# Check for a valid session cookie
+if ( http.getCookie($cookieName) ) {
+   $cookieArray = checkCookie($cookieSecret, $cookieName);
+   if ( $cookieArray ) {
+      debug(3, "User has session and it is valid");
+      $pool = $cookieArray[3];
+   } else {
+      debug(3, "User has invalid or expired session, returning expired page");
+      returnPage("200 OK", "expired.html", "Set-Cookie: " . $cookieName . 
+                 "=expired; path=/; expires=Thu, Jan 01 1970 00:00:00 UTC; HttpOnly", connection.data.get("TEMPLATE_LINK"));
+      $pool = "";
+   }
+} else {
+   debug(3, "New user with no session cookie accessed site");
+   $pool = "";
+}
+
+# If we have a pool, then the user has a valid session.
+if ( $pool ) {
+   
+   # Let all requests for static content straight through - don't bother updating the cookie 
+   # or housekeeping, but update the cookie if the timeout is close to sessionTimeoutInit
+   $path = http.getPath();
+   if ( string.regexmatch($path, $ignoredTypes) ) {     
+      
+      # Update the cookie if the timeout is soon (ie timeout <= sessionTimeoutInit)
+      $initTimeOut = sys.time() + $sessionTimeoutInit;
+      if ( $cookieArray[1] <= $initTimeOut ) {
+         debug(3, "User Cookie close to timeout - updating with standardTimeout");
+         updateCookie($cookieSecret, $cookieName, $cookieArray, $sessionTimeout);
+      }
+      # Use the pool
+      usePool($pool);
+      
+      # finish rule here
+      debug(4, "Ignoring Content: " . $path);
+      break;
+   }
+   
+   # Run housekeeping
+   houseKeeping( $mypid, $sessionTimeout, $houseKeepingMax, $houseKeepingFreq, $houseKeepingBusy,
+                 $counterSessionExpire, $counterStandardSessions, $counterHighVolumeSessions );
+
+   # update cookie
+   updateCookie($cookieSecret, $cookieName, $cookieArray, $sessionTimeout);
+   counter64.increment($counterSessionUpdate);
+   
+   usePool($pool);
+   
+} else {
+   
+   # Run housekeeping
+   houseKeeping( $mypid, $sessionTimeout, $houseKeepingMax, $houseKeepingFreq, $houseKeepingBusy,
+                 $counterSessionExpire, $counterStandardSessions, $counterHighVolumeSessions );   
+
+   # We're a new session - check for returning user
+   $qs = http.getQueryString();
+   if ( $qs && string.contains($qs, $returningQS) ) {
+      debug(3, "The new user has visited us before. Returning is true");
+      $returning = true;
+   } else {
+      debug(3, "The new user has not been here before. Returning is false");
+      $returning = false;
+   }
+
+   # Select the pool to use for this new user  
+   $pool = selectPool($returning, $pidlist, $loadedStandard, $busyStandard, $busyHighVolume, $counterStandardBusy, $counterHighVolumeBusy);
+   
+   # Update the Counter after we assign a new user
+   $countUpdate = data.get("Counter." . $pool . "." .$mypid);
+   $countUpdate++;
+   data.set("Counter." . $pool . "." .$mypid, $countUpdate);
+   debug(4,"Counter update: Counter." . $pool . "." .$mypid . " is now: " . $countUpdate);
+   
+   # Issue cookie
+   issueCookie($cookieSecret, $cookieName, $sessionTimeoutInit, $pool);
+   counter64.increment($counterSessionNew);
+   
+   # Use the pool
+   usePool($pool);
+
+}
+

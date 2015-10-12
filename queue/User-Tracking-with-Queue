@@ -1,0 +1,750 @@
+#=-Version 1.0 (Initial Release)
+# Session Cookie Name
+$config["cookieName"] = "vTMSession";
+
+# Secret for the cookies
+$config["cookieSecret"] = "Us3rQu3u31ng000Hf4ncY";
+
+# Ignored Content Types
+$config["ignoredTypes"] = "\\.(css|jpg|gif|png|js)$";
+
+# Initial Session Timeout in seconds - limit possibility of DoS by setting the initial session timeout low.
+# We switch to the normal session timeout once a session has been reused.
+$config["initialTimeout"] = 5;
+
+# Session idle timeout in seconds.
+$config["sessionTimeout"] = 120;
+
+# Waiting Room idle Timeout
+$config["waitingRoomTimeout"] = 60;
+
+# Busy Session limit for Application
+$config["sessionLimit"] = 25;
+
+# Max Waiting Room Queue Length
+$config["waitingRoomLimit"] = 60;
+
+# Does vTM manage the WaitingRoom or do we use a server pool?
+$config["waitingRoomUsesPool"] = false;
+
+# Waiting room html template if we are delivering the queue page (ie waitingRoomUsesPool == false)
+# The WaitingRoom pool will still be used for page furniture. images, css, etc.
+$config["waitingRoomTemplatePage"] = "waitingroom.html";
+
+# Waiting room too busy page
+$config["waitingRoomTooBusyPage"] = "toobusy.html";
+
+# Invalid/Expired Session page. leave blank if you just want the user to be given a new session
+$config["invalidSessionPage"] = "badsession.html";
+
+# Child process watchdog idle time, Set to 0 to disable.
+$config["watchdogTime"] = 0;
+
+# Child processes (cores) expected. Used by watchdog to detect dead children
+$config["childprocs"] = 2;
+
+#==============================================================================
+# All of the HousKeeping Settings below are applied by each child for each pool
+#
+# When the number of tracked sessions exceeds the $houseKeeping["Busy"] threshold,
+# we run housekeeping on every request, but only process a maximum of
+# $houseKeeping["Max"] sessions per request.
+#==============================================================================
+ 
+# Maximum sessions to check during a house keeping run
+$houseKeeping["Max"] = 20;
+ 
+# House keeping frequency (every n requests) when load is below the busy threshold.
+$houseKeeping["Freq"] = 10;
+ 
+# Busy threshold for house keeping - below this we only do housekeeeping every $houseKeeping["Freq"] requests.
+$houseKeeping["Busy"] = 10;
+ 
+#==============================================================================
+# User 64bit Counters
+#==============================================================================
+ 
+# Counters for new, updated, and expired sessions
+$counters["sessionNew"] = 1;
+$counters["sessionUpdate"] = 2;
+$counters["sessionExpire"] = 3;
+ 
+# Counters for Concurrent sessions for Online Users
+$counters["applicationSessions"] = 4;
+
+# Counters for Waiting Room Users
+$counters["waitingRoomSessions"] = 5;
+$counters["waitingRoomExpire"] = 6;
+$counters["waitingRoomMigrated"] = 7;
+
+# Session Completed (eg Checked out)
+$counters["sessionComplete"] = 8;
+ 
+ 
+#==============================================================================
+# Debug function. Set Debug level (0 to 4) to log information from the script.
+# 0 (zero) will only log errors. Level 1 is the least and Level 4 is the most
+# verbose.
+#==============================================================================
+sub debug($level, $string) {
+  
+   # SET THE DEBUG LEVEL HERE!!
+   $debug = 4;
+  
+   if ( $level == 0 ) {
+      log.warn("ERR: " . sys.getPid() . " " . $level . "-> " . $string);
+   } else if ( $debug >= $level ) {
+      log.info("DBG: " . sys.getPid() . " " . $level . "-> " . $string);
+   }
+     
+}
+ 
+#==============================================================================
+# Pool selection - Modify the pool.use() lines to use the actual name of your
+# Application and WaitingRoom pools.
+#==============================================================================
+sub usePool($pool) {
+   if ( $pool == "Application" ) {
+      if (ssl.isssl()) {
+         pool.select("www.demo.local");
+      } else {
+         pool.select("www.demo.local");
+      }
+   } else {
+       pool.select("WaitingRoom");
+   }
+}
+ 
+ 
+#==============================================================================
+#==============================================================================
+ 
+                       ###  DO NOT MODIFY BELOW HERE ###
+ 
+#==============================================================================
+#==============================================================================
+ 
+ 
+# Return the pids of all the stingray children (which have handled traffic)
+sub getChildren($mypid) { 
+   
+   $pidlist = [];
+  
+   $children = data.get("StingrayPIDS");
+   if ( ! $children ) {
+      data.set("StingrayPIDS", $mypid);
+      array.push($pidlist, $mypid);
+      debug(1,"getChildren: FIRST Child: " . $mypid . " added to pidlist");
+   } else {
+      $pidlist = string.split( $children, "," );
+      if ( ! array.contains( $pidlist, $mypid ) ) {
+         debug(1,"getChildren: NEW Child: " . $mypid . " added to pidlist");
+         data.set("StingrayPIDS", $children . "," . $mypid);
+         array.push($pidlist, $mypid);
+      }
+   } 
+   debug(3, "getChildren: PIDS: " . lang.dump($pidlist));
+   return $pidlist; 
+}
+
+# Remove any inactive children from the pidlist. They will readd themselves if they are still with us.
+sub watchdog($mypid, $pidlist, $config) {
+   
+   $time = sys.time();
+   $lastRun = data.local.get("watchdog");
+   $childNum = array.length($pidlist);
+   
+   if ( ! $lastRun ) {
+      data.local.set("watchdog",$time);
+   } else if ( $childNum > $config["childprocs"] ) {
+      # VTM Launched a new child process??
+      debug(0, "watchdog: Child death? : Num Children: " . $childNum . ", Cores: " . $config["childprocs"] . ". Resetting pidlist.");
+      data.set("StingrayPIDS", $mypid); 
+   } else if ( ($config["watchdogTime"]>0) && ($time - $lastRun > ( ($config["watchdogTime"]/2) + math.random($config["watchdogTime"]/2) ) ) ) {
+      # Check for hung/idle children and remove them.
+      debug(3, "watchdog: " . $mypid . " : Checking for dead children.");
+      $newlist = $mypid;     
+      foreach ($child in $pidlist) {
+         if ($child == $mypid)
+            continue;
+         $lastRun = data.get($child);
+         if ( $time - $lastRun < $config["watchdogTime"] ) {
+            $newlist .= "," . $child;
+         } else {
+            debug(3, "watchdog: " . $mypid . " : Reaping inactive/dead child: " . $child);
+            data.remove("Counter.Application." .$child );
+            data.remove("Counter.WaitingRoom." .$child );
+            data.remove("WaitingRoomQueuePos.".$child);
+         }
+      }
+      data.local.set("watchdog",$time);
+      data.set("StingrayPIDS",$newlist);
+      debug(3, "watchdog: " . $mypid . " : Task Complete.");
+   }
+}
+ 
+# Count up all of the active sessions known by the child processes.
+sub countMeUpScotty($pidlist, $pool) {
+  
+   $count = 0;
+   foreach ( $pid in $pidlist ) {
+      $childCount = data.get("Counter." . $pool . "." .$pid);
+      debug(2, "countMeUpScotty: Child: ". $pid .": Pool: ". $pool .": Count: " . $childCount );
+      if ( $childCount ) {
+         $count += $childCount;
+      }
+   }
+   debug(1, "countMeUpScotty: " . $pool . ": TOTAL: " . $count);
+   return $count;
+}
+
+# Select pool based on load and customer type
+sub selectPool($pidlist, $config, $counters) {
+ 
+   # Count up Application users
+   $countApplication = countMeUpScotty($pidlist, "Application");
+
+   # Count up WaitingRoom users
+   $countWaiting = countMeUpScotty($pidlist, "WaitingRoom");
+    
+   # New sessions only get access to the Application if there's enough space for everyone.
+   if ( $countApplication + $countWaiting < $config["sessionLimit"] ) {
+      debug(3, "selectPool: User Assigned to Pool: Application");
+      return "Application";
+   } 
+   # If the Waiting Room is full send them an error page
+   else if ( $countWaiting >= $config["waitingRoomLimit"] ) {
+      debug(3, "selectPool: User sent Busy page. WaitingRoom is full!");
+      returnPage("503 Server Too Busy", $config["waitingRoomTooBusyPage"], "", "");
+   }
+   # Send user to the Waiting Room
+   else {
+      debug(3, "selectPool: User Sent Assigned to Pool: WaitingRoom");
+      counter64.increment( $counters["waitingRoomSessions"] );
+      return "WaitingRoom";
+   }
+}
+
+# Process to migrate users from WaitingRoom into the Application pool
+sub bouncer($mypid, $pidlist, $config, $counters) {
+   
+   # Get lists
+   $sessionsWaiting = data.local.get("mySessions.WaitingRoom");
+   $sessionsWaiting = string.split($sessionsWaiting, ",");
+   
+   # Are there users in the WaitingRoom?
+   if ( array.length($sessionsWaiting) == 0 ) {
+      debug(4, "bouncer: This Child Has No Users Waiting");
+      return;
+   }
+   
+   $sessions = countMeUpScotty($pidlist, "Application");
+   debug(4, "bouncer: Application Sessions: " . $sessions . ", Limit: " . $config["sessionLimit"]);
+   if ( $sessions >= $config["sessionLimit"] ) {
+      return;
+   }
+   
+   $deQueue = lang.toInt( ( $config["sessionLimit"] - $sessions ) / $config["childprocs"] );
+   debug(4, "bouncer: DeQueue Count: " . $deQueue);
+   if ( $deQueue < 1 ) {
+      return;
+   }
+
+   if ( $deQueue > array.length($sessionsWaiting) ) {
+      $deQueue = array.length($sessionsWaiting);
+   }
+   
+   $sessionsApplication = data.local.get("mySessions.Application");
+   debug(4, "bouncer: Migrating " . $deQueue . " Users");
+   for ( $1=0; $i < $deQueue ; $i++ ) {
+      $session = array.shift($sessionsWaiting);
+      debug(3, "bouncer: Migrating WaitingRoom Session: " . $session);
+      counter64.increment($counters["waitingRoomMigrated"]);
+      $sessionsApplication = $sessionsApplication . "," . $session;
+      if ( ! $config["waitingRoomUsesPool"] ) {  
+         $wrQueues = string.split(data.get("WaitingRoom.". $mypid .".DeQueues"), ",");
+         foreach ($queue in $wrQueues) {
+            $qCount = data.get("WaitingRoom.". $mypid .".DeQueued.". $queue) +1;
+            data.set("WaitingRoom.". $mypid .".DeQueued.". $queue, $qCount);
+         }
+      }
+   }
+
+   data.local.set("mySessions.WaitingRoom", array.join($sessionsWaiting,",") );
+   data.local.set("mySessions.Application", $sessionsApplication );
+
+   $sessionQueue = data.get("SessionQueue.".$session);
+   if ($sessionQueue) {
+      $sessionQueue = string.split( $sessionQueue, ",");   
+      data.set("WaitingRoomQueuePos.". $mypid, sprintf("%f",$sessionQueue[1]) ); 
+      debug(3, "bouncer: WaitingRoomQueuePos Time: " . $sessionQueue[1]);
+   } else {
+      debug(0, "bouncer: Waiting Room update Failed. Session disappeard?: " . $session);
+   }
+}
+ 
+# Remove stale sessions and update our counter in global memory
+sub houseKeeping($mypid, $config, $houseKeeping, $counters) {
+  
+   $time = sys.time();
+   debug(2, "houseKeeping: Started"); 
+
+   $sessionsApplication = data.local.get("mySessions.Application");
+   $sessionsApplication = string.split($sessionsApplication, ",");
+   $sessionsWaiting = data.local.get("mySessions.WaitingRoom");
+   $sessionsWaiting = string.split($sessionsWaiting, ",");
+  
+   $hkCounter = data.local.get("HouseKeepingCounter");
+   $hkCounter++;
+   data.local.set("HouseKeepingCounter", $hkCounter);
+  
+   $force = false;
+   if ( ( ( $hkCounter % $houseKeeping["Freq"] ) == 1 ) ) {
+      # Do a run everytime our modulo returns 1. This ensures we set up counters on first run of a child
+      debug(2,"houseKeeping: " . $houseKeeping["Freq"] . " requests have passed since last run. Forcing run");
+      $force = true;
+   } else if ( sys.time() - data.local.get("HouseKeepingLastRun") >= $config["sessionTimeout"] ) {
+      # If it's been longer than a session timeout since we last ran, force a run.
+      debug(2,"houseKeeping: " . $config["sessionTimeout"] . " seconds have passed since last run. Forcing run");
+      $force = true;
+      # We're forcing a run, so reset the HouseKeepingCounter to 2.
+      data.local.set("HouseKeepingCounter",2);
+   }
+  
+   if ( ( array.length($sessionsApplication) > $houseKeeping["Busy"] ) || $force ) {
+      # Perform housekeeping
+      debug(2,"houseKeeping: Processing Application. Old Count: " . array.length($sessionsApplication));
+      debug(3, "houseKeeping: Application Sessions: " . lang.dump($sessionsApplication)  );  
+      $sessionsApplication = doHouseKeeping($mypid, $sessionsApplication, $houseKeeping, $config, "Application", $counters["sessionExpire"]);
+      data.local.set("mySessions.Application", array.join($sessionsApplication,",") );
+      debug(2, "houseKeeping: Application processed. New Count: " . array.length($sessionsApplication) ); 
+      # Now process WaitingRoom
+      debug(2,"houseKeeping: Processing WaitingRoom. Old Count: " . array.length($sessionsWaiting));
+      debug(3, "houseKeeping: WaitingRoom Sessions: " . lang.dump($sessionsWaiting)  );  
+      $sessionsWaiting = doHouseKeeping($mypid, $sessionsWaiting, $houseKeeping, $config, "WaitingRoom", $counters["waitingRoomExpire"]);
+      data.local.set("mySessions.WaitingRoom", array.join($sessionsWaiting,",") );
+      data.local.set("HouseKeepingLastRun", sys.time() );
+      debug(2, "houseKeeping: WaitingRoom processed. New Count: " . array.length($sessionsWaiting) ); 
+   }
+  
+   $arrayLengthApplication = array.length($sessionsApplication);
+   $arrayLengthWaitingRoom = array.length($sessionsWaiting);
+  
+   debug(3, "houseKeeping: Counters Updated: Application: " . $arrayLengthApplication);
+   data.set("Counter.Application." .$mypid, $arrayLengthApplication );
+
+   debug(3, "houseKeeping: Counters Updated: WaitingRoom: " . $arrayLengthWaitingRoom);
+   data.set("Counter.WaitingRoom." .$mypid, $arrayLengthWaitingRoom );
+  
+   # Update the user counters at most once/second
+   if ( $time != data.local.get("CounterIncrementTime") ) {
+      debug(4, "houseKeeping: Updating user counters for concurrent sessions");
+      counter64.increment($counters["applicationSessions"], $arrayLengthApplication );
+      counter64.increment($counters["waitingRoomSessions"], $arrayLengthWaitingRoom );
+      data.local.set("CounterIncrementTime", $time);
+   }
+  
+   debug(2, "houseKeeping: Finished");
+}
+ 
+# The housekeeping function has determined housekeeping is necessary. So do it!
+sub doHouseKeeping($mypid, $sessions, $houseKeeping, $config, $pool, $expireCounter) {
+ 
+   $newSessions = [];
+   $processed = 0;
+   $time = sys.time();
+   
+   if ( $pool == "WaitingRoom" && ( ! $config["waitingRoomUsesPool"] ) ) {
+      $wrRun = sprintf("%f", sys.time.highres());
+      data.set("WaitingRoom.". $mypid .".DeQueued.". $wrRun, 0);
+      $wrQueues = string.split(data.get("WaitingRoom.". $mypid .".DeQueues"), ",");
+      array.push($wrQueues, $wrRun);
+      data.set("WaitingRoom.". $mypid .".DeQueues", array.join($wrQueues, ",") );
+   }
+   
+   $position = data.local.get("houseKeeping.".$pool."offSet");
+   if ( $position && $position != 0 ) {
+      $newSessions = array.copy($sessions);
+      $end = array.length($sessions) - $position;
+      if ( $end < 0 ) $end = 0;
+      array.splice($newSessions, $position, $end);
+      array.splice($sessions, 0, $position);
+   }
+   debug(3,"doHouseKeeping: Previous HK Position: ". $position ." Skipping: ". lang.dump($newSessions));
+   debug(3,"doHouseKeeping: Processing: ". lang.dump($sessions));
+  
+   while ( $session = array.shift($sessions) ) {
+     
+      $data = data.get("Session.". $session);
+      debug(3, "doHouseKeeping: Checking Session: " . $session . ": " . $data );
+      if ( ! $data ) {
+         # Hmmm we've lost our session???
+         debug( 0, "doHouseKeeping: Session I'm looking after has been abducted by aliens! Session: " . $session);
+      } else {
+         debug( 3, "doHouseKeeping: Session time remaining: " . $data - $time );
+         if ( $data > $time ) {
+            debug(3, "doHouseKeeping: Keeping Session: " . $session);
+            array.push($newSessions , $session);
+            if ( $wrRun ) {
+               $sq = string.split(data.get("SessionQueue.".$session), ",");
+               $sq[2] = $wrRun;
+               $sq[3] = ++$position;
+               data.set("SessionQueue.".$session, array.join($sq,","));
+            }                      
+         } else {
+            debug(3, "doHouseKeeping: Removing Session: " . $session);
+            data.remove("Session.".$session);
+            data.remove("SessionQueue.".$session);
+            counter64.increment($expireCounter);
+         }
+      }
+     
+      $processed++;
+      if ( $processed >= $houseKeeping["Max"] ) {
+         debug(3, "doHouseKeeping: Sessions Processed: " . $processed);
+         break;
+      }
+     
+   }
+ 
+   if ( array.length($sessions) == 0 ) {
+      data.local.set("houseKeeping.".$pool."offSet", 0);
+      if ( $wrRun ) {
+         if ( array.length($newSessions) > 0 ) {
+            $firstq = string.split(data.get("SessionQueue.".$newSessions[0]),",");
+            debug(4, "HK First Queue: ". lang.dump($firstq) );
+            if ( $firstq[2] != 0 ){
+               while ( $wrQueues[0] != $firstq[2] ){
+                  $deadQueue = array.shift($wrQueues);
+                  debug(4, "Removing obsolete queue counter: " . $deadQueue);
+                  data.remove("WaitingRoom.". $mypid .".DeQueued.".$deadQueue);
+               }
+               data.set("WaitingRoom.". $mypid .".DeQueues", array.join($wrQueues, ",") );
+            }
+         }
+      }
+
+   } else {
+      data.local.set("houseKeeping.".$pool."offSet", array.length($newSessions) );
+   }
+   
+   array.append($newSessions, $sessions);
+   debug(3,"doHouseKeeping: NOT-Processed: ". lang.dump($sessions));
+   debug(3,"doHouseKeeping: New List: ". lang.dump($newSessions));
+   return $newSessions;
+}
+
+# Generate new session and cookie for new user
+sub issueCookie($mypid, $config, $pool) {
+  
+   # Generate Unique Session ID using timestamp, Client IP, Port and random digit
+   $timeout = sys.time() + $config["initialTimeout"] ;
+   $hires = lang.toDouble(sys.time.highres());
+   $ip = request.getRemoteIP();
+   $port = request.getRemotePort();
+   $rawUrl = http.getRawUrl();
+  
+   $cookieSessionTxt =  sprintf("SESS_%f_%s:%d", $hires, $ip, $port);
+   $cookieSession = string.base64Encode( string.hashSHA1( $cookieSessionTxt ) );
+   debug(3, "issueCookie: Generated Session Key: " . $cookieSession . " from: " . $cookieSessionTxt);
+  
+   # Add this session to this childs housekeeping list.
+   $mySessions = data.local.get("mySessions.".$pool);
+   if ( $mySessions ) {
+      data.local.set("mySessions.".$pool, $mySessions . "," . $cookieSession);
+   } else {
+      data.local.set("mySessions.".$pool, $cookieSession);
+   }
+  
+   # Create the cookieArray and store the session timeout in global memory
+   $cookieArray = [ $cookieSession, $timeout, request.getRemoteIP(), $pool , $rawUrl, $mypid, sprintf("%f",$hires) ];
+   $cookieString = array.join($cookieArray);
+   data.set("Session.".$cookieSession, $timeout);
+   data.set("SessionQueue.".$cookieSession, sprintf("%s,%f,0,0", $mypid, $hires));
+  
+   # Encrypt and set the response cookie
+   $cookieCrypted = string.encrypt( $cookieString, $config["cookieSecret"] );  
+   http.setResponseCookie($config["cookieName"], $cookieCrypted, "path=/; HttpOnly");
+   connection.data.set("cookieHeader", "Set-Cookie: ". $config["cookieName"] . "=" . $cookieCrypted ."; path=/; HttpOnly\r\n" );
+  
+   debug(2, "issueCookie: Session: " . lang.dump($cookieArray));
+   return $cookieArray;
+}
+
+# update the cookie for the user
+sub updateCookie($config, $cookieArray) {
+   
+   if ( $cookieArray[3] == "Application" ) {
+      $timeout = sys.time() + $config["sessionTimeout"];
+   } else {
+      $timeout = sys.time() + $config["waitingRoomTimeout"];
+   }
+   
+   $cookieArray[1] = $timeout;
+   $cookieString = array.join($cookieArray);
+  
+   debug(3, "updateCookie: Session: " . lang.dump($cookieArray));
+  
+   # Check to see if the session exists in memory... If not add it and take responsibility for housekeeping
+   $session = data.get("Session.".$cookieArray[0]);
+   if ( ! $session ) {
+     
+      debug(2, "updateCookie: Untracked Session: " . $cookieArray[0] . " - User migrated from another active Stingray or software restart?");
+     
+      # This session must have been created on a different STM or we were restarted.
+      # Check the sessions we have for the pool
+      $mySessions = data.local.get("mySessions.".$cookieArray[3]);
+      if ( ! $mySessions ) {
+         # This is this childs first sessions for this pool
+         data.local.set("mySessions.".$cookieArray[3], $cookieArray[0]);
+      } else if ( string.contains($mySessions, $cookieArray[0] ) ) {
+         # Session already in list (shouldn't happen)
+         debug(0,"updateCookie: Odd... I'm already looking after a session I don't know about?? Session: " . lang.dump($cookieArray) );
+      } else {
+         # Add the session to this childs housekeeping list
+         data.local.set("mySessions.".$cookieArray[3], $mySessions . "," . $cookieArray[0]);
+      }
+   }
+  
+   data.set("Session.".$cookieArray[0], $timeout );
+  
+   $cookieCrypted = string.encrypt( $cookieString, $config["cookieSecret"] );  
+   http.setResponseCookie($config["cookieName"], $cookieCrypted, "path=/; HttpOnly");
+   connection.data.set("cookieHeader", "Set-Cookie: ". $config["cookieName"] . "=" . $cookieCrypted ."; path=/; HttpOnly\r\n" );
+}
+
+# Check session is still valid, return CookieArray or empty string if invalid
+sub checkCookie($config) {
+   $time = sys.time();
+   $ip = request.getRemoteIP();
+   $cookie = http.getCookie($config["cookieName"]);
+   $cookieString = string.decrypt($cookie, $config["cookieSecret"]);
+   $cookieArray = string.split($cookieString);
+  
+   debug(3, "checkCookie: Session: " . lang.dump($cookieArray));
+  
+   if ( $cookieArray[1] < $time ) {
+      debug(2, "checkCookie: Session Expired: " . $cookieArray[0] );
+      return "";
+   }
+   if ( $cookieArray[2] != $ip ) {
+      debug(2, "checkCookie: Session IP Changed: " . $cookieArray[0] );
+      return "";
+   }
+  
+   return $cookieArray;
+}
+
+# remove the session cookie
+sub removeCookie($config, $counters, $cookieArray) {
+   $time = sys.time() - 1;
+   data.set("Session.".$cookieArray[0], $time );
+   http.setResponseCookie($config["cookieName"],"expired","path=/; expires=Thu, Jan 01 1970 00:00:00 UTC; HttpOnly");
+   connection.data.set("cookieHeader", "Set-Cookie: ". $config["cookieName"] . "=expired; path=/; expires=Thu, Jan 01 1970 00:00:00 UTC; HttpOnly\r\n" );
+   debug(3, "removeCookie: Session Finished: ". $cookieArray[0]);
+   counter64.increment($counters["sessionComplete"]);
+}
+ 
+# Send a page back to the user directly. Check for resource on disk, fall back to a default message if missing
+sub returnPage($code, $resource, $headers, $tmplvars) {
+   
+   debug(1, "returnPage: STM sending page to user: " . $code . " - " . $resource);
+   if ( resource.exists($resource) ) {
+      $resource = resource.get($resource);
+   } else {
+      debug(1, "returnPage: resource not found: " . $resource . ". Default Page Delivered");
+      $resource = "<html><head><title>Too  Busy</title></head><body><h1>Sorry, we're too  busy</h1><p>Please try  later...</p></body></html>\r\n";
+   }
+   
+   # Replace the Templated Variables
+   if ( $tmplvars ) {
+      foreach ( $key in hash.keys( $tmplvars ) ) {
+         $resource = string.replaceAll($resource, $key, $tmplvars[$key]);
+      }
+   }
+  
+   # ensure STM responses are uncacheable.
+   $headers = "Cache-Control: private, max-age=0\r\n" . $headers;
+   http.sendResponse($code, "text/html", $resource, $headers);
+}
+
+sub waitingRoom($mypid, $config, $pidlist, $cookieArray, $new) {
+   
+   if ( $config["waitingRoomUsesPool"] ) {
+      
+      http.addHeader("X-Session-Data", array.join($cookieArray,","));
+      http.addHeader("X-STM-PID", $mypid);
+      
+   } else {
+            
+      $sessionsWaiting = data.local.get("mySessions.WaitingRoom");
+      $sessionsWaiting = string.split($sessionsWaiting, ",");
+      #$totalQueueLength = countMeUpScotty($pidlist, "WaitingRoom");
+      
+      $headers = connection.data.get("cookieHeader");     
+      $session = $cookieArray[0];
+      
+      if ( $new ) {
+         $position = array.length($sessionsWaiting);
+         $queueID = $mypid;
+      } else { 
+         $sq = string.split(data.get("SessionQueue.".$session),",");
+         debug(4, "watingRoom: Session: " . lang.dump($sq) );
+         $wrQueues = string.split(data.get("WaitingRoom.". $sq[0] .".DeQueues"), ",");
+         
+         if ( $sq[3] == 0 ) {
+            $position = array.length($sessionsWaiting);
+         } else {
+            $deQueued = data.get("WaitingRoom.".$sq[0].".DeQueued.".$sq[2]);
+            if ( $deQueued ) {
+               $position = $sq[3] - $deQueued;
+               debug(3, "waitingRoom: Have WR Queue, Removed Sessions: " . $deQueued . ", Position: ". $position);
+            } else {
+               $position = $sq[3];
+               debug(3, "waitingRoom: NO WR Queue, Position: " . $position);
+            }
+         }
+         $queueID = $sq[0];
+      }
+   
+      if ( $position < 1 ) {
+         $position =1;
+      }
+      
+      $tmplvars["QUEUE_POSITION"] = $position;
+      $tmplvars["QUEUE_ID"] = $queueID;
+      $tmplvars["QUEUE_SESSION"] = $session;
+      
+      returnPage("200 OK", $config["waitingRoomTemplatePage"], $headers, $tmplvars);
+      
+   }
+   
+}
+ 
+########################
+### MAIN CODE BLOCK ####
+########################
+ 
+# Create this childs identifier
+$mypid = "PID." . sys.getPid();
+data.set($mypid, sys.time());
+ 
+# Get the child pids
+$pidlist = getChildren($mypid);
+
+# Run the watchdog to check for dead/hung children
+watchdog($mypid, $pidlist, $config);
+ 
+# Check for a valid session cookie
+if ( http.getCookie($config["cookieName"]) ) {
+   $cookieArray = checkCookie($config);
+   if ( $cookieArray ) {
+      debug(3, "main: User has session and it is valid");
+      $pool = $cookieArray[3];
+   } else {
+      if ( $config["invalidSessionPage"] != "" ) {
+         debug(3, "main: User has invalid or expired session. Returning invalid session page.");
+         returnPage("200 OK", $config["invalidSessionPage"], "Set-Cookie: ". $config["cookieName"] .
+                    "=expired; path=/; expires=Thu, Jan 01 1970 00:00:00 UTC; HttpOnly", "");  
+      } else {
+         debug(3, "main: User has invalid or expired session. Ignored.");
+         $pool = "";
+      }
+   }
+} else {
+   debug(3, "main: New user with no session cookie accessed site");
+   $pool = "";
+}
+ 
+# If we have a pool, then the user has a valid session.
+if ( $pool ) {
+  
+   # Let all requests for static content straight through - don't bother updating the cookie
+   # or housekeeping, but update the cookie if the timeout is close to sessionTimeoutInit
+   $path = http.getPath();
+   if ( string.regexmatch($path, $config["ignoredTypes"]) ) {    
+      
+      # Update the cookie if the timeout is soon (ie timeout <= sessionTimeoutInit)
+      $initTimeOut = sys.time() + $config["initialTimeout"];
+      if ( $cookieArray[1] <= $initTimeOut ) {
+         debug(3, "main: User Cookie close to timeout - updating with sessionTimeout");
+         updateCookie($config, $cookieArray);
+      }
+      # Use the pool
+      usePool($pool);
+     
+      # finish rule here
+      debug(4, "main: Ignoring Content: " . $path);
+      break;
+   }
+
+   # Run housekeeping
+   houseKeeping($mypid, $config, $houseKeeping, $counters);
+   
+   # Check for WaitingRoom Users
+   bouncer($mypid, $pidlist, $config, $counters);
+   
+   # update cookie
+   updateCookie($config, $cookieArray);
+   counter64.increment($counters["sessionUpdate"]);
+   
+   # Process users in WaitingRoom
+   if ( $pool == "WaitingRoom" ) {
+      
+      # Check the current user
+      $userSession = $cookieArray[0];
+      $issuingPid = $cookieArray[5];
+      $issuingTime = $cookieArray[6];
+      debug(3, "main: WaitingRoom Session: ". $userSession .", ". $issuingPid .", Time: ". $issuingTime);
+
+      $queuePos = data.get("WaitingRoomQueuePos." . $issuingPid);
+      if ( $issuingTime <= $queuePos ) {
+         # User is leaving the WaitingRoom
+         debug(2, "main: WatingRoom Session Migrated: ". $userSession .", IssuingTime: ". $issuingTime .", QueuePos:". $queuePos);
+         $cookieArray[3] = "Application";
+         $pool = "Application";
+         updateCookie($config, $cookieArray);
+      } else {
+         debug(3, "main: WaitingRoom Session still WAITING: ". $userSession);
+         waitingRoom($mypid, $config, $pidlist, $cookieArray, false);
+      }
+      
+   }
+  
+   usePool($pool);
+  
+} else {
+  
+   # Run housekeeping
+   houseKeeping($mypid, $config, $houseKeeping, $counters);
+
+   # Check for WaitingRoom Users
+   bouncer($mypid, $pidlist, $config, $counters);
+   
+   # Select the pool to use for this new user 
+   $pool = selectPool($pidlist, $config, $counters);
+  
+   # Update the Counter after we assign a new user
+   $countUpdate = data.get("Counter." . $pool . "." .$mypid);
+   $countUpdate++;
+   data.set("Counter." . $pool . "." .$mypid, $countUpdate);
+   debug(4,"main: Counter update: Counter." . $pool . "." .$mypid . " is now: " . $countUpdate);
+  
+   # Issue cookie
+   $cookieArray = issueCookie($mypid, $config, $pool);
+   counter64.increment($counters["sessionNew"]);
+   
+   if ( $pool == "WaitingRoom" ) {
+      waitingRoom($mypid, $config, $pidlist, $cookieArray, true);
+   }
+   
+   # Use the pool
+   usePool($pool);
+ 
+}
+
+$path = http.getPath();
+if ( $path == "/checkoutDone" ) {
+   removeCookie($config, $counters, $cookieArray);  
+}
+

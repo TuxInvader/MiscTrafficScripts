@@ -1,0 +1,312 @@
+# ASN BER Enoding for LDAP Version 1.1
+
+# ASN.1 BER Encoding - TLV (Type, Length, Value)
+#
+# Type - BYTE 1
+# Type - bits 7/8 == class Universal, Application, Context Specific, or private
+# Type - bits 6 == P/C (Primitive/Constructed) on == constructed, off == primitive
+# Type - bits 1-5 == Number (eg Boolean, Integer, Sequence)
+#
+# Length - BYTE 2 : < 128 == length, 128 == Indefinite, >128 == number of bytes used to encode length
+#   
+# Value - The value -- of type and length specified.
+#
+# 2012-12-02: Bug Fix: Correctly handle BER Messages which use 3 bytes to hold the length. The TS string.bytesToInt()
+#             requires 1,2 or 4 bytes. If bytes are 3, then we need to pad with an extra byte.
+#             Bug Fix: Correctly decode sequences which are exactly 127 bytes long. Doh!
+#
+# 2012-12-11: Add new function decodeParts($data, $parts, $level) to allow for decoding only to a certain depth
+#             if $parts is 0 then the it behaves exactly the same as decodeSeq(). The new function is used to 
+#             make decoding lazy in libLdap_1.1. Should improve performance for packets you have no interest in
+
+
+sub getAsnNumbers() {
+ 
+   $primitives = [ 0 => "EoC", 1 => "Boolean", 2 => "Integer", 3 => "BitString", 4 => "OctetString",
+               5 => "NULL", 6 => "ObjectIdentifier", 7 => "ObjectDescriptor", 8 => "External",
+               9 => "Real(float)", 10 => "Enumerated", 11 => "EmbededPDV", 12 => "UTF8String",
+               13 => "RelativeOID", 16 => "Sequence", 17 => "Set", 18 => "NumericString",
+               19 => "PrintableString", 20 => "T21String", 21 => "VideotexString", 22 => "IA5String",
+               23 => "UTCTime", 24 => "GeneralizedTime", 25 => "GraphicString", 26 => "VisibleString",
+               27 => "GeneralString", 28 => "UniversalString", 29 => "CharacterString", 30 => "BMPString" ];
+   
+   return $primitives;
+   
+}
+
+# Return a hash containing the details for this ASN type. Hash includes the class, constructed/primitive,
+# the number, and the type string.
+sub getAsnType($asnType) {
+   
+   $class = $asnType & 0xC0;
+   $number = $asnType & 0x1f;
+   $numbers = getAsnNumbers();
+   
+   if ( $class == 0 ) {
+      $class = "Universal";
+   } else if ( $class == 64 ) {
+      $class = "Application";
+   } else if ( $class == 128 ) {
+      $class = "Context-specific";
+   } else {
+      $class = "private";
+   }
+   
+   if ( $asnType & 0x20 ) {
+      $constructed = 1;
+   } else {
+      $constructed = 0;
+   }
+   
+   return $type = [ "class" => $class, "constructed" => $constructed, 
+                "number" => $number, "type" => $numbers[$number] ];
+   
+}
+
+# Encode the provided data with the ASN type
+sub encode($asnType, $data) {
+   
+   $asnDetail = getAsnType($asnType);
+   
+   if (  $asnDetail["constructed"] || $asnDetail["class"] == "Context-specific" ) {
+      # Treat constructed and context specific types as strings
+      return encodeString($asnType, $data);
+   } else if ( String.contains($asnDetail["type"],"String" ) ) {
+      # use encodeString if the types primitive is a String
+      return encodeString($asnType, $data);
+   } else if ( $asnDetail["type"] == "Boolean" || $asnDetail["type"] == "Integer" 
+                                               || $asnDetail["type"] == "Enumerated" ) {
+      # Treat Boolean, Integers, and Enumerations as integers
+      return encodeInteger($asnType, $data);
+   }
+   
+   # Hmmm we didn't do anything with the data. We obviously don't know how to handle it.
+   log.warn("libBerCodec currently does not understand how to encode ASN.1 Type:"  . $asnType);
+   return -1;
+      
+}
+
+# Decode a full sequence of BER encoeded data. Only stop when we reach the end of the data
+sub decodeSeq($data) {
+   return decodeParts($data, 0, 0);
+}
+
+# Decode a sequence down to $parts levels. if $parts is 0 then decode everything.
+sub decodeParts($data, $parts, $level) {
+ 
+   $offset = 0; 
+   $items = array.create(0,0);
+   $level++;
+      
+   while ( $offset < string.length($data) ) {
+      
+      $start = $offset;
+      $asnType = String.bytestoInt(string.substring($data, $offset, $offset));
+      $length = getLength($data, ++$offset);
+      $offset = $1;
+      $end = $offset + $length -1;
+      
+      $asnDetail = getAsnType($asnType);
+      #log.info( string.hexencode($data) );
+      #log.warn( string.sprintf("substring: %d, %d, %d ", $length, $start, $end));
+      $item = string.substring($data, $start, $end);
+      #log.warn("Hex: " . string.hexencode($item));
+      $item = decodeItem( $item );
+      
+      if ( $asnDetail["constructed"] ) {
+         
+         $rec = string.substring($data, $offset, $end);
+         
+         if ( ( $parts != 0 ) && $level >= $parts ) {
+            $item["value"] = $rec;
+         } else {
+            $item["value"] = decodeParts( $rec, $parts, $level);
+         }
+         
+      }
+      
+      array.push($items, $item);
+      $offset = ++$end;
+      
+   }
+   
+   return $items;
+  
+}
+
+# Decode an individual item.
+sub decodeItem($data) {
+   
+   $asnType = String.bytestoInt(string.substring($data, 0, 0));
+   $length = String.bytestoInt(String.substring($data, 1, 1));
+   
+   if ( $length < 128 ) {     
+      
+      if ( ($length + 2) != String.length($data) ) {
+         log.warn("Decode fail. The data supplied is not a valid BER TLV. " . $length);
+         return -1;
+      }     
+      $value = String.substring($data, 2, ( 2 + $length));     
+      
+   } else if ( $length == 128 ) {
+      
+      # Length undefined     
+      $eoc = string.inttoBytes(0,2);
+      if ( ! String.endswith($data, $eoc) ) {
+         log.warn("Decode fail. The supplied data has no length and no terminating TLV. " . $length);
+         return -1;
+      }          
+      $value = string.substring($data, 2, string.length($data)-3); 
+      
+   } else {   
+      
+      $bytes = $length - 128;
+      $byteData = string.substring($data,2,(2+$bytes-1));
+      if ( $bytes == 3 )
+         $byteData = string.intToBytes(0,1) . $byteData;
+          
+      $length = string.bytestoInt( $byteData );
+       
+      if ( ($length + 2 + $bytes) != String.length($data) ) {
+         log.warn("Decode fail. The data supplied is not a valid BER TLV. " . $length . ":" . $bytes);
+         return -1;
+      }
+      $value = String.skip($data,(2+$bytes));
+      
+   }
+   
+   # If the data is a boolean, int, or enum then convert the bytes to an integer
+   if ($asnType == 1 || $asnType == 2 || $asnType == 10 ) {
+      $value = string.bytestoInt($value);
+   }
+   
+   $decode = [ "type" => $asnType, "length" => $length, "value" => $value ];
+   return $decode;
+      
+}
+         
+sub encodeSeq($sequence) {
+   
+   $items = array.copy($sequence);
+   $sequence = "";
+   
+   while( array.length( $items ) > 0 ) {
+      $item = array.pop( $items );
+      if ( $item["length"] == 0 ) {
+         $sequence = encode($item["type"], "") . $sequence;
+      } else if ( lang.isArray($item["value"]) ) {
+         $val = encodeSeq($item["value"]);
+         $sequence = encode($item["type"],$val) . $sequence;
+      } else {
+         $sequence = encode($item["type"], $item["value"]) . $sequence;
+      }
+   }
+   return $sequence;
+   
+}
+
+sub encodeInteger($asnType, $data) {
+ 
+   $ber = string.inttoBytes($asnType, 1);
+   
+   if ( $data < 0 ) {
+      if ( $data > -128 ) {
+         $lv = String.inttoBytes(1,1) . String.inttoBytes($data, 1);
+      } else if ( $data > -65536 ) {
+         $lv = String.inttoBytes(2,1) . String.inttoBytes($data, 2);
+      } else if ( $data > -2147483646 ) {
+         $lv = string.inttoBytes(4,1) . String.inttoBytes($data, 4);
+      } else {
+         log.warn("libBerCodec can not encode Integers larger than 2147483645" );
+         return -1;
+      }
+   } else {
+      if ( $data < 128 ) {
+         $lv = String.inttoBytes(1,1) . String.inttoBytes($data, 1);
+      } else if ( $data < 65536 ) {
+         $lv = String.inttoBytes(2,1) . String.inttoBytes($data, 2);
+      } else if ( $data < 2147483646 ) {
+         $lv = string.inttoBytes(4,1) . String.inttoBytes($data, 4);
+      } else {
+         log.warn("libBerCodec can not encode Integers larger than 2147483645" );
+         return -1;
+      }
+   }
+   
+   return $ber . $lv;
+   
+}
+
+sub encodeString($asnType, $data) {
+   
+   $ber = string.inttoBytes($asnType, 1);
+   
+   $length = string.length($data);
+   $eoc = 0;
+  
+   if ( $length == 0 ) {
+       $len = string.inttoBytes(0,1);
+    } else if ( $length < 128 ) {
+       $len = string.inttoBytes($length,1);
+    } else if ( $length < 256 ) {
+       $len = string.inttoBytes(129, 1) . String.inttoBytes($length,1);
+    } else if ( $length < 65536 ) {
+       $len = string.inttoBytes(130, 1) . String.inttoBytes($length,2);
+    } else if ( $length <= 2147483646 ) {
+       # LDAP MAXINT is 2147483646
+       $len = string.inttoBytes(132, 1) . String.inttoBytes($length,4);
+    } else {
+       $len = string.inttoBytes(128,1);
+       $eoc = 1;
+    }
+    
+    if ($eoc) {
+       # EOC == 0x00 0x00 and is required if we can't encode the length
+       $ber .= $len . $data . String.inttoBytes(0,2);
+    } else {
+       $ber .= $len . $data;
+    }  
+    return $ber;
+}
+
+
+# Get the length of the next value. The offset should point to the byte to be read, this function will
+# set $1 to be the next byte after the length field when it is done (ie the first byte of the value). 
+sub getLength($raw, $offset) {
+   
+   $len = string.bytestoInt(string.substring($raw, $offset, $offset));
+  
+   if ( $len >= 128 ) {
+      
+      if ( $len == 128 ) {
+         # If the length is exactly 128, then the data is of indefinite length
+         $len = -1;
+      } else {
+         # If the length is longer than 128 bytes, then more than one byte is
+         # needed to hold the length value.
+         $bytes = $len - 128;                  
+         $needed = ++$offset + $bytes;
+
+         if ( string.len($raw) < $needed ) {
+            if ( rule.getState() == "REQUEST" ) {
+               $raw = request.get($needed);
+            } else {
+               $raw = response.get($needed);
+            }
+         }
+    
+         $byteData = string.substring($raw,$offset,$needed-1);
+         if ( $bytes == 3 )
+            $byteData = string.intToBytes(0,1) . $byteData;
+         
+         $len = string.bytestoInt( $byteData );
+         $offset = $needed;
+      }
+   } else {
+     $offset++;
+   }
+   
+   $1 = $offset;
+   return $len;
+}
+

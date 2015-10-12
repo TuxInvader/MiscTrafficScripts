@@ -1,0 +1,113 @@
+# LDAP Auth library Version 1.1
+
+import libLdap_1.1 as ldap;
+import libBerCodec_1.1 as ber;
+
+# Perform a Simple Bind to the provided server using the provided
+# credentials. Returns a negative number on error, or the LDAP Result
+# code. Ie 0 == Success, 49 == Invalid Credentials, etc, etc.
+sub checkLdapAuth($server, $port, $bindDn, $pass) {   
+   $obj = connectLdap($server, $port);
+   if ( ! $obj["connected"] )
+      return -1;
+   
+   $req = newAuthSimple($obj, $bindDn, $pass);   
+   $res = doAuthSimple($obj, $req);
+   if ( ! $res )
+      return -2;
+   
+   $code = array.shift( $res["request"] );
+   unbind($obj);
+   return $code["value"];
+}
+
+# Connect to an LDAP server. Return a hash containing the socket, and 
+# connection information. Hash can also be used to track the MessageID.
+sub connectLdap($server, $port) {
+   
+   $obj = [ "connected" => 0, "sock" => $sock, "messageID" => 0 ];
+   
+   $sock = tcp.connect($server, $port, 2000);
+   if( ! $sock ) {
+      log.error( "Error: " . $1 );   
+   } else { 
+      $obj[ "sock" ] = $sock;
+      $obj[ "connected" ] = 1;
+   }
+   return $obj;
+}
+
+# Returns a new LDAP Packet of type BindRequest for use in Simple LDAP
+# authentication.
+sub newAuthSimple( $obj, $bindDn, $pass ) {
+   
+   $obj["messageID"] = $obj["messageID"] + 1;
+   $packet = ldap.newPacket($obj["messageID"], 96);  
+   
+   $request = array.create(0);
+   array.push($request, ["type" => 2, "length" => 1, "value" => 3]);
+   array.push($request, ["type" => 4, "length" => string.length($bindDn), "value" => $bindDn]);
+   array.push($request, ["type" => 128, "length" => string.length($pass), "value" => $pass]);
+   $packet["request"] = $request;
+   
+   $length = String.length(ber.encodeSeq($request));
+   $packet["length"] = $length;
+   
+   return $packet;  
+}
+
+sub newSearch( $obj, $baseDn, $scope ) {
+   
+   $obj["messageID"] = $obj["messageID"] + 1;
+   $packet = ldap.newPacket($obj["messageID"], 99);  
+   
+   $request = array.create(0);
+   # baseDN
+   array.push($request, ["type" => 4, "length" => string.length($baseDn), "value" => $baseDn]);
+   # Scope
+   array.push($request, ["type" => 10, "length" => 1, "value" => $scope]);
+   # Deref Aliases? Not sure what to use. 0 == NeverDerefAliases 
+   array.push($request, ["type" => 10, "length" => 1, "value" => 0]);
+   # size Limit (Integer)
+   
+   $packet["request"] = $request;
+   
+   $length = String.length(ber.encodeSeq($request));
+   $packet["length"] = $length;
+   
+   return $packet;  
+}
+
+# Carry out an LDAP Bind using Simple authentication
+sub doAuthSimple($obj, $packet) {   
+   $request = ldap.encodePacket($packet);   
+   $write = tcp.write($obj["sock"], $request);
+   if ( $write < 0) {
+      $1 = "failed to write to socket";
+      return "";
+   }    
+   $response = tcp.read($obj["sock"], 1024, 5);
+   if ( ! $response ) {
+      $2 = "failed to read response";
+      return "";
+   }  
+   $resPacket = ldap.processPacket($response);
+   $resPacket["request"] = ber.decodeParts($resPacket["request"],0,0);
+   return $resPacket;
+}
+
+# Send an unbind request, and then close the connection.
+sub unbind($obj) {   
+   $obj["messageID"] = $obj["messageID"] + 1;
+   $packet = ldap.newPacket($obj["messageID"], 66);
+   $request = ldap.encodePacket($packet);   
+   $write = tcp.write($obj["sock"], $request);    
+   close($obj);  
+}
+
+# Close the socket to the LDAP server
+sub close($obj) {
+   tcp.close($obj["sock"]);
+}
+
+

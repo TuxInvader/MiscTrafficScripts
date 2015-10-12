@@ -1,0 +1,771 @@
+# LDAP library Version 1.1
+#
+# 2012-11-30: Modified packet processing to support multiple LDAP messages in a response.
+#             New Function getNextPacket($lastByte);
+#
+# 2012-12-02: New Function getSearchResultDetails($packet)
+#             New Function updateSearchResultDetails($packet, $searchResult)
+#
+# 2012-12-11: Version 1.1. Library now supports lazy processing.
+#             getnextPacket() now only decodes the ProtocolOp and MessageID from the packet.
+#             further data is decoded as it is requested in other functions (eg getSearchDetails, getBindDeatils, etc)
+
+import libBerCodec_1.1 as ber;
+
+# Returns the LDAP Operation types
+sub getLdapTypes() {
+   return $ops = [ 0 => "BindRequest", 1 => "BindResponse", 2 => "UnbindRequest",
+               3 => "SearchRequest", 4 => "SearchRequestEntry", 5 => "SearchResultDone", 
+               6 => "ModifyRequest", 7 => "ModifyResponse", 
+               8 => "AddRequest", 9 => "AddResponse",
+               10 => "DeleteRequest", 11 => "DeleteResponse",
+               12 => "ModifyDNRequest", 13 => "ModifyDNResponse",
+               14 => "CompareRequest", 15 => "CompareResponse",
+               16 => "AbandonRequest", 
+               23 => "ExtendedRequest", 24 => "ExtendedResponse", 25 => "IntermediateResponse",
+               19 => "SearchResultReference" ];
+}
+
+
+# Returns the LDAP authentication types
+sub getAuthTypes() {
+   return $auths = [ 128 => "SIMPLE", 163 => "SASL" ];
+}
+
+# Returns the LDAP Search scope types
+sub getScopeTypes() {
+   return $scopes = [ 0 => "base", 1 => "single", 2 => "sub" ];  
+}
+
+# GetPacket is fine for requests, because the state engine will process each packet individually. 
+# If however we want to process responses, then we should be using getNextPacket() with an offset
+sub getPacket() {
+   return getNextPacket(0);
+}
+
+# Get the LDAP Packet. This function reads in the LDAP data and returns a hash. 
+# The Hash Contains: "messageID", "protocolOp", "request", "length", and "lastByte".
+# The protocolOp can be used to decide what to do with the request. 
+# The nextPacket entry will contain the offset of the next LDAP Message.
+# Eg: If it's a BindRequest Then you might want to use getBindDetails($packet) next. 
+sub getNextPacket($lastByte) {
+   
+   if ( rule.getState() == "REQUEST" ) {
+
+      $raw = request.get(2);
+      $length = ber.getLength($raw, 1);
+      $offset = $1;
+      $raw = request.endsAt($offset + $length);
+      
+   } else {
+
+      if ( ($lastByte != 0 ) && ($lastByte == response.getLength()) ) {
+         #connection.sleep( 50 );
+         #if ( $lastByte == response.getLength() ) 
+            return "";
+      }
+      
+      $raw = response.get($lastByte + 2);
+      $length = ber.getLength($raw, $lastByte + 1);
+      $offset = $1;
+      $raw = response.get($offset + $length);
+      $raw = string.skip($raw, $lastByte);
+      
+   }
+
+   $packet = processPacket($raw);
+   if ( ! lang.isHash($packet) ) {
+      close();
+   }
+   
+   $packet["firstByte"] = $lastByte;
+   $packet["lastByte"] = $offset + $length;
+
+   return $packet;
+}
+
+
+# This function does most of the work for getPacket(), but does not require the
+# packet to come in from request or response data. It expects you to give it a 
+# raw packet as an argument. 
+sub processPacket($raw) {
+   
+   # Parse the packet through the BER decoder, but only to two levels
+   $items = ber.decodeParts($raw, 2, 0);
+
+   $envelopeH = array.shift($items);
+   $envelopeD = $envelopeH["value"];  
+   $messageID = array.shift($envelopeD);   
+   $messageH = array.shift($envelopeD);
+   
+   # If we don't have a valid MessageID, then exit.
+   if ( $messageID["type"] != 2 || ( $messageID["value"] <= 0 ) ) {
+   
+      log.warn("Invalid LDAP Message. No Message ID found. " .
+               "Client: " . request.getRemoteIP() );
+      return;
+   
+   }
+     
+   $packet = [ "messageID" => $messageID["value"], "protocolOp" => $messageH["type"],
+             "request" => $messageH["value"], "length" => $messageH["length"] ];
+   
+   return $packet;
+}
+
+# Creates a completely empty LDAP packet.
+sub newPacket($messageID, $protocolOp) {
+   $packet = [ "messageID" => $messageID, "protocolOp" => $protocolOp,
+             "request" => "", "length" => 0 ];
+   return $packet;
+}
+
+# If no changes have been made to the LDAP packet, then this function can be used to copy 
+# the packet data directly from the input (as-is). If you have made changes then you need
+# to use encodePacket() instead.
+sub skipPacket($packet) {  
+   if ( rule.getState() == "REQUEST" ) {
+      $input = request.get( request.getLength() );
+      $output = string.substring($input, $packet["firstByte"], $packet["lastByte"] -1 );
+   } else {
+      $input = response.get( response.getLength() );
+      $output = string.substring($input, $packet["firstByte"], $packet["lastByte"] -1 );
+   }
+   return $output;
+}
+
+# If changes have been made to the LDAP packet, then this function will generate a request
+# to match the data in $packet. You must call this after making changes if you want to 
+# alter the actual ldap packet. Use with request.set( encodePacket($packet) ) or via a
+# wrapper function. Eg updateSearch().
+sub encodePacket($packet) {  
+   if ( $packet["length"] == 0) {
+      $request = "";
+   } else {
+      if ( lang.isArray($packet["request"]) ) {
+         $request = ber.encodeSeq($packet["request"]);
+      } else {
+         $request = $packet["request"];
+      }
+   }
+   $request = ber.encode($packet["protocolOp"], $request);
+   $mid = ber.encode(2,$packet["messageID"]);
+   $request = ber.encode(48, $mid . $request);
+   return $request;
+}
+
+# This function returns the type of Operation in textual form. 
+# Eg ProtocolOp 0 == BindRequest
+sub getOp($packet) {
+   $t = getLdapTypes();
+   $appID = $packet["protocolOp"] & 31;
+   return $t[ $appID ];
+}
+
+# Return the scope in textual form. Eg: Scope 0 == base
+sub getScope($search) {
+   $s = getScopeTypes();
+   return $s[ $search["scope"] ];
+}
+
+# This function takes a LDAP packet as provided by getPacket() and decodes the Bind information.
+# Only call this function if the packet has a protocolOp of BindRequest. Function returns:
+# A hash containing: "version", "bindDN", "authMethod", "authValue"
+sub getBindDetails($packet) {
+   
+   # Decode the request if necessary
+   if ( ! lang.isArray($packet["request"]) ) {
+      $packet["request"] = ber.decodeParts($packet["request"],0,0);
+   }
+
+   if ( $packet["protocolOp"] != 96 ) {
+      log.warn("Attempt to use getBindDetails() on a non binding operation. " . 
+               "Closing connection to client: " . request.getRemoteIP());
+      close();
+   }
+
+   $request = array.copy($packet["request"]);
+   $version = array.shift($request);
+   
+   #if ( $version["value"] != 3 ) {
+   #   log.warn("Client is not using LDAP v3.");
+   #}
+      
+   $binding = array.shift($request);
+   
+   if ( $binding["length"] == 0 ) {
+      $name = "";
+   } else {
+      $name = $binding["value"];
+   }
+   
+   $auth = array.shift($request);
+             
+   return $bindDetail = [ "version" => $version["value"], "bindDN" => $name, 
+                          "authMethod" => $auth["type"], "authValue" => $auth["value"] ];
+}
+
+# Checks to see if this request is StartTLS.
+sub isStartTLS($packet) {
+   
+   # Decode the request if necessary
+   if ( ! lang.isArray($packet["request"]) ) {
+      $packet["request"] = ber.decodeParts($packet["request"],0,0);
+   }
+   
+   if ($packet["protocolOp"] == 119 ) {
+      $request = array.copy($packet["request"]);
+      $ldapOID = array.shift($request);
+      if ( $ldapOID["value"] == "1.3.6.1.4.1.1466.20037" ) {
+         return 1;
+      }
+   }
+   return 0;
+}
+
+# Accept the StartTLS Request. Once this packet has been sent, the client will initiate
+# the TLS handshake. You should loop through to a ldaps service at that point.
+sub acceptStartTLS($packet) { 
+   sendLDAPResponse($packet["messageID"], 120, 0, "1.3.6.1.4.1.1466.20037", "", 0);  
+}
+
+# Reject the StartTLS Request with result code 52 (unavailable). You may optionally provide
+# a message to the user.
+sub rejectStartTLS($packet, $message) { 
+   log.warn( $message . " :: " . lang.dump($packet) );
+   sendLDAPResponse($packet["messageID"], 120, 52, "1.3.6.1.4.1.1466.20037", $message, 0);  
+}
+
+# This function takes a LDAP packet as provided by getPacket() and decodes the Search information.
+# Only call this function if the packet has a protocolOp of SearchRequest. Function returns:
+# Hash containing: "baseObject", "scope", "derefAliases", "sizeLimit", "timeLimit", "typesOnly", 
+#                  "filters",  "attributes" 
+sub getSearchDetails($packet) {
+   
+   # Decode the request if necessary
+   if ( ! lang.isArray($packet["request"]) ) {
+      $packet["request"] = ber.decodeParts($packet["request"],0,0);
+   }
+
+   if ( $packet["protocolOp"] != 99 ) {
+      log.warn("Attempt to use getSearchDetails() on a non searching operation. " . 
+               "Closing connection to client: " . request.getRemoteIP());
+      close();
+   }
+   
+   $request = array.copy($packet["request"]);
+   
+   $base = array.shift($request);
+   if ( $base["type"] != 4 ) {
+      # The Base Object is sent as an Octet String
+      log.warn("The first element in a Search Request should be the Base Object. " .
+               "Rejecting search from client: " . request.getRemoteIP());
+      rejectSearch($packet["messageID"], "INVALID SEARCH REQUEST");
+   }
+      
+   if ( $base["length"] == 0 ) {
+      $baseDN = "";
+   } else {
+      $baseDN = $base["value"];
+   }
+
+   $scope = array.shift($request);
+   if ( $scope["type"] != 10 || $scope["length"] != 1 ) {
+      log.warn("The scope in a Search Request should be an Enumeration type. " .
+               "Rejecting search from client: " . request.getRemoteIP());
+      rejectSearch($packet["messageID"], "INVALID SEARCH REQUEST");
+   }
+     
+   $dAliases = array.shift($request);
+   if ( $dAliases["type"] != 10 || $dAliases["length"] != 1 ) {
+      log.warn("The derefAliases in a Search Request should be an Enumeration type. " .
+               "Rejecting search from client: " . request.getRemoteIP());
+      rejectSearch($packet["messageID"], "INVALID SEARCH REQUEST");
+   }
+   
+   $sLimit = array.shift($request);
+   $tLimit = array.shift($request);
+   $typesOnly = array.shift($request);
+   $filters = array.shift($request);
+   $attributes = array.shift($request);
+   
+   return $search = [ "baseObject" => $baseDN, "scope" => $scope["value"], 
+          "derefAliases" => $dAliases["value"], "sizeLimit" => $sLimit["value"],
+          "timeLimit" => $tLimit["value"], "typesOnly" => $typesOnly["value"], 
+          "filters" => $filters,  "attributes" => $attributes["value"], 
+          "messageID" => $packet["messageID"] ];
+
+}
+
+# This functions takes in a search details hash as returned from getSearchDetails() and 
+# decodes the attributes. Returns a space separated list of attributes.
+sub getSearchAttributes($search) {   
+   if ( ! hash.contains($search, "attributes") ) {
+      # $search is not a Search Description hash
+      return "";
+   } 
+   $attributes = $search["attributes"];   
+   #$list = array.create(0);
+   foreach ( $attr in $attributes ) {      
+      #array.push($list, $attr["value"]);
+      $list = $list . " " . $attr["value"];      
+   }   
+   return String.trim($list); 
+}
+
+
+# This functions takes in a search details hash as returned from getSearchDetails() and 
+# a space seperated list of attributes and updates the search hash accordingly. 
+sub setSearchAttributes($search, $attributes) { 
+  
+   $attArray = array.create(0);
+   foreach( $attr in String.split($attributes) ) {
+      $item = [ "type" => 4, "length" => string.length($attr), "value" => $attr ];
+      array.push($attArray, $item);
+   }
+   $search["attributes"] = $attArray;  
+}
+
+# This function takes in a search details hash as returned from getSearchDetails() and
+# returns a human readable LDAP filter string.
+sub getSearchFilter($search) {   
+   if ( ! hash.contains($search, "filters") ) {
+      # $search is not a Search Description hash
+      return "";
+   }
+   $filters = $search["filters"];
+   return decodeSubfilter($search["messageID"], $filters);  
+}
+
+# This function is called by getSearchFilter($search) to convert the LDAP structure 
+# into a human readable LDAP filter string. You should probably call that function instead.
+sub decodeSubfilter($mid, $filter) {
+   
+   $type = $filter["type"] & 31;
+   
+   if ( $type < 3 ) {
+      
+      # AND, OR, NOT have their elements in arrays.
+      
+      if ( lang.isArray( $filter["value"] ) ) {        
+         $arr = array.copy($filter["value"]) ;
+         while ( array.length($arr) > 0 ) {           
+            $hash = array.shift($arr);
+            $filt .= decodeSubfilter($mid, $hash);                        
+         }         
+      } else {
+         log.warn("Client has sent an invalid filter. " . 
+                  "Rejecting search from client: " . request.getRemoteIP());
+         rejectSearch($mid, "INVALID SEARCH FILTER");
+      }
+      
+      if ( $type == 0 ) {
+         $filt = "(&" . $filt . ")";
+      } else if ( $type == 1 ) {
+         $filt = "(|" . $filt . ")";
+      } else if ( $type == 2 ) {
+         $filt = "(!" . $filt . ")";
+      } 
+      
+   } else {
+      
+      if ( $type == 3 ) {
+         # equalitymatch
+         $attr = array.shift($filter["value"]);
+         $val = array.shift($filter["value"]);
+         $filt = "(" . $attr["value"] . "=" . $val["value"] . ")";
+      } else if ( $type == 4 ) {
+         # substrings
+         $attr = array.shift($filter["value"]);
+         $match = array.shift($filter["value"]);
+         if ( $match["type"] == 48 ) {           
+            $sub = array.shift($match["value"]);
+            $val = $sub["value"];   
+            
+            if ( $sub["type"] == 128 ) {
+               $val = $val . "*";
+            } else if ( $sub["type"] == 129 ) {
+               $val = "*" . $val . "*";
+            } else {
+               $val = "*" . $val;
+            }
+            
+            $filt = "(" . $attr["value"] . "=" . $val . ")";
+         } else {
+            log.warn("Client has sent an invalid filter. Substring not encoded properly." . 
+                     "Rejecting search from client: " . request.getRemoteIP());
+            rejectSearch($mid, "INVALID SEARCH FILTER");
+         }
+ 
+      } else if ( $type == 5 ) {
+         # greaterEqual
+         $attr = array.shift($filter["value"]);
+         $val = array.shift($filter["value"]);
+         $filt = "(" . $attr["value"] . ">=" . $val["value"] . ")";
+      } else if ( $type == 6 ) {
+         # lesserEqual
+         $attr = array.shift($filter["value"]);
+         $val = array.shift($filter["value"]);
+         $filt = "(" . $attr["value"] . "<=" . $val["value"] . ")";
+      } else if ( $type == 7 ) {
+         # present =*
+         $filt = "(" . $filter["value"] . "=*)";
+      } else if ( $type == 8 ) {
+         # approx match
+         $attr = array.shift($filter["value"]);
+         $val = array.shift($filter["value"]);
+         $filt = "(" . $attr["value"] . "~=" . $val["value"] . ")";
+      } else if ( $type == 9 ) {
+         # extensible match
+         $filt = decodeExtensiblefilter($filter["value"]);
+      }
+   }   
+   return $fs . $filt . $fe;   
+}
+
+# This function is called by decodeSubFilter() when it happens accross an extensible
+# filter. You should probably call getSearchFilter($search) and let that magic happen.
+sub decodeExtensiblefilter($filterArray) {
+
+   while ( array.length($filterArray) > 0 ) {
+      
+      $array = array.shift($filterArray);
+      
+      $type = $array["type"] & 31;
+      if ( $type == 1 ) {
+         # MatchingRule     
+      
+      } else if ( $type == 2 ) {
+         # matchType     
+         $t = $array["value"] . ":";
+      } else if ( $type == 3 ) { 
+         # matchValue
+         $v = $array["value"];      
+      } else if ( $type == 4 ) {
+         # dnAttributes BOOLEAN 
+         if ( $array["value"] == "\xFF" )
+            $dn="dn:";
+      }
+   }
+   return "(" . $t . $dn . "=" . $v . ")";
+
+}
+
+# This function takes in a search details hash as returned from getSearchDetails() and
+# a human readable LDAP filter string, and updates the Search details to match. After 
+# using this function you probably want to use updateSearch($packet, $search) to commit
+# the changes to the actual LDAP request.
+sub setSearchFilter($search, $filter) {
+   $search["filters"] = encodeSubfilter($search["messageID"], $filter);
+}
+
+# This function is called by setSearchFilter($search, $filter) to update your search
+# hash with your new filter. You probably want to call that instead.
+sub encodeSubfilter($mid, $filter) {
+
+   while( $filter ) {
+      
+      if ( String.regexmatch($filter, "^\\(\\&(.*\\))\\)(.*)" ) ) {
+         $sub = $1;
+         $filter = $2;
+         $sub = encodeSubFilter($mid, $sub);
+         $seq = ber.encodeSeq($sub);
+         return [ "type" => 160, "length" => string.length($seq), "value" => $sub ];
+      } else if ( String.regexmatch($filter,"^\\(\\|(.*\\))\\)(.*)") ) {
+         $sub = $1;
+         $filter = $2;
+         $sub = encodeSubFilter($mid, $sub);
+         $seq = ber.encodeSeq($sub);
+         return [ "type" => 161, "length" => string.length($seq), "value" => $sub ];
+      } else if ( String.regexmatch($filter,"^\\(\\!(.*\\))\\)(.*)") ) {
+         $sub = $1;
+         $filter = $2;
+         $sub = encodeSubFilter($mid, $sub);
+         $seq = ber.encodeSeq($sub);
+         return [ "type" => 162, "length" => string.length($seq), "value" => $sub ];
+      } else {
+         
+         $filt = array.create(0);
+         while ( String.regexmatch($filter, "^(\\([^\\)]*\\))(.*)$" ) ) {
+            
+            $sub = $1;
+            $filter = $2;
+            
+            if ( string.regexmatch($sub, "^\\((.*?)~=(.*?)\\)$" ) ) {
+               # approx match
+               $data = array.create(0);
+               array.push($data, [ "type" => 4, "length" => string.length($1), "value" => $1 ]); 
+               array.push($data, [ "type" => 4, "length" => string.length($2), "value" => $2 ]); 
+               $seq = ber.encodeSeq($data);           
+               array.push($filt, ["type" => 168, "value" => $data, "length" => string.length($seq)]); 
+            } else if ( string.regexmatch($sub, "^\\((.*?)>=(.*?)\\)$" ) ) {
+               # Greater/Equal
+               $data = array.create(0);
+               array.push($data, [ "type" => 4, "length" => string.length($1), "value" => $1 ]); 
+               array.push($data, [ "type" => 4, "length" => string.length($2), "value" => $2 ]); 
+               $seq = ber.encodeSeq($data);           
+               array.push($filt, ["type" => 165, "value" => $data, "length" => string.length($seq)]); 
+            } else if ( string.regexmatch($sub, "^\\((.*?)<=(.*?)\\)$" ) ) {
+               # lesser/equal
+               $data = array.create(0);
+               array.push($data, [ "type" => 4, "length" => string.length($1), "value" => $1 ]); 
+               array.push($data, [ "type" => 4, "length" => string.length($2), "value" => $2 ]); 
+               $seq = ber.encodeSeq($data);           
+               array.push($filt, ["type" => 166, "value" => $data, "length" => string.length($seq)]); 
+            } else if ( string.regexmatch($sub, "^\\((.*?)=\\*\\)$" ) ) {
+               # Is Present
+               array.push($filt, ["type" => 135, "value" => $1, "length" => string.length($1)]); 
+            } else if ( string.regexmatch($sub, "^\\((.*?)=\\*(.*?)\\*\\)$" ) ) {
+               # substring *foo*
+               array.push($filt, encodeSubString(129, $1, $2) );       
+            } else if ( string.regexmatch($sub, "^\\((.*?)=\\*([^\\)]*)\\)$" ) ) {
+               # substring *foo
+               array.push($filt, encodeSubString(130, $1, $2) );
+            } else if ( string.regexmatch($sub, "^\\((.*?)=(.*?)\\*\\)$" ) ) {
+               # substring foo*
+               array.push($filt, encodeSubString(128, $1, $2) );
+            } else if ( string.regexmatch($sub, "^\\((.*?)=(.*?)\\)$" ) ) {
+               # equality match
+               $data = array.create(0);
+               array.push($data, [ "type" => 4, "length" => string.length($1), "value" => $1 ]); 
+               array.push($data, [ "type" => 4, "length" => string.length($2), "value" => $2 ]); 
+               $seq = ber.encodeSeq($data);           
+               array.push($filt, ["type" => 163, "value" => $data, "length" => string.length($seq)]); 
+            } else {
+               log.warn("oops: encoding failed for: " . $sub . ". TrafficScript error??? " .
+                        "Rejecting search from client: " . request.getRemoteIP());
+               rejectSearch($mid, "SERVER ERROR");
+            }
+
+         }
+         if ( array.length($filt) == 1 ) {
+            return array.pop($filt);
+         } else {
+            return $filt;
+         }
+      }
+   
+   }
+
+}
+
+# This function is used by encodeFilter($filter) to encode substring parts of the filter
+# You probably want to use setSearchFilter($search, $filter), not this directly.
+sub encodeSubString($type, $att, $val) {
+   $value = array.create(1,["type" => $type, "length" => string.length($val), "value" => $val] );
+   $seq = ber.encodeSeq($value);
+   $data = array.create(0);
+   array.push($data, [ "type" => 4, "length" => string.length($att), "value" => $att ]);
+   array.push($data, [ "type" => 48, "length" => string.length($seq), "value" => $value ]);
+   $seq = ber.encodeSeq($data); 
+   return [ "type" => 164, "length" => string.length($seq), "value" => $data ];
+}
+
+# Applies the search details provided to the packet provided, overwriting any
+# Search attributes/filters already present. We then call setPacket($packet)
+# to build the real packet. Use request.set to update the request itself.
+sub updateSearch($packet, $search) {
+
+   # Attributes are the last element of a LDAP Search.
+   $oldAtts = array.pop($packet["request"]);
+   
+   # Filters are the second from last. Pop those off too
+   $oldFilter = array.pop($packet["request"]);
+   
+   # Pull of the base and scope of the original packet
+   $oldBase = array.shift($packet["request"]);
+   $oldScope = array.shift($packet["request"]);
+   
+   # If the scope has changed push the new scope on, else restore the old one
+   if ( $oldScope["value"] != $search["scope"] ) {
+      array.unshift($packet["request"], ["type" => 10, "length" => 1, "value" => $search["scope"] ] );
+   } else {
+      array.unshift($packet["request"], $oldScope);
+   }
+   
+   # If the base has changed push the new base on, else restore the old one
+   if ( $oldBase["value"] != $search["baseObject"] ) {
+      array.unshift($packet["request"], ["type" => 4, "length" => string.length($search["baseObject"]), "value" => $search["baseObject"] ] );
+   } else {
+      array.unshift($packet["request"], $oldBase);
+   }
+      
+   
+   # Push on the updated filter
+   array.push($packet["request"], $search["filters"]);
+   
+   # Push on the updated attributes
+   $seq = ber.encodeSeq($search["attributes"]);
+   array.push($packet["request"], [ "type" => 48, "length" => string.length($seq), "value" => $search["attributes"]] );
+
+   return encodePacket($packet);     
+}
+
+# This function takes a LDAP packet as provided by getPacket() and decodes the SearchResult information.
+# Only call this function if the packet has a protocolOp of SearchResultEntry. Function returns:
+# Hash containing: "objectName", a hash containing the "attributes", and the "messageID"
+sub getSearchResultDetails($packet) {
+   
+   # Decode the request if necessary
+   if ( ! lang.isArray($packet["request"]) ) {
+      $packet["request"] = ber.decodeParts($packet["request"],1,0);
+   }
+
+   if ( $packet["protocolOp"] != 100 ) {
+      log.warn("Attempt to use getSearchResultEntryDetails() on a non searching operation. " . 
+              "Returning null: Client:" . request.getRemoteIP() . "Message ID: " . $packet["messageID"]);
+      return "";
+   }
+   
+   $request = array.copy($packet["request"]);
+  
+   $object = array.shift($request);
+   if ( $object["type"] != 4 ) {
+      # The Object (LDAPDN) is sent as an Octet String
+      log.warn("The first element in a Search Result Entry should be the Object LDAPDN. This doesn't look valid?");
+      return "";
+   }
+      
+   if ( $object["length"] == 0 ) {
+      $objectName = "";
+   } else {
+      $objectName = $object["value"];
+   }
+
+   $attributes = array.shift($request);
+   
+   return $searchResult = [ "objectName" => $objectName, "attributes" => $attributes, "messageID" => $packet["messageID"] ];
+
+}
+
+# Take in a searchResult object and decode the attributes from it.
+sub getSearchResultAttributes($searchResult) {
+   
+   $attributes = $searchResult["attributes"];
+   
+   # If the attributes have not been doceded yet, then decode them.
+   if ( ! lang.isArray($attributes["value"]) ) {
+      $attributes["value"] = ber.decodeParts($searchResult["attributes"]["value"],0,0);
+   }
+   
+   $types = [];
+   foreach ( $attr in $attributes["value"] ) {     
+      $attsArray = [];
+      foreach( $attsEntry in $attr["value"][1]["value"] ) {
+         array.push($attsArray, $attsEntry["value"]);
+         $types[ $attr["value"][0]["value"].$attsEntry["value"] ] = $attsEntry["type"] ;
+      }
+      $atts[$attr["value"][0]["value"]] = $attsArray;     
+   }   
+   
+   $searchResult["attributes"] = $atts;
+   $searchResult["types"] = $types;
+   return $searchResult;
+}
+
+# Applies the searchResult details provided to the packet provided, overwriting the
+# SearchResultEntry with the information in $searchResult. We then call encodePacket($packet)
+# to build the real packet. 
+# Note: We don't worry about setting correct lengths. encodePacket() will do that as long as
+# the length != 0.
+sub updateSearchResultDetails($packet, $searchResult) {
+   
+   if ( $packet["protocolOp"] != 100 ) {
+      log.warn("Attempt to use updateSearchResultDetails() on a non searching operation. " . 
+              "Returning null: Client:" . request.getRemoteIP() . "Message ID: " . $packet["messageID"]);
+      return "";
+   }
+   
+   $object["type"] = 4;
+   $object["value"] = $searchResult["objectName"];
+   $object["length"] = string.length( $object["value"] );
+   
+   $attrArray = [];
+   foreach ( $attribute in hash.keys( $searchResult["attributes"] ) ) {
+      $atts = [] ;
+      $attKeyHash["type"] = 4;
+      $attKeyHash["value"] = $attribute;
+      $attKeyHash["length"] = string.length( $attKeyHash["value"] );
+      $attValHash["type"] = 49;
+      foreach ( $value in $searchResult["attributes"][$attribute] ) {
+         if ( hash.contains($searchResult["types"], $attribute.$value ) ) {
+            $type = $searchResult["types"][$attribute.$value];
+         } else {
+            $type = 4;
+         }
+         array.push($atts, [ "type" => $type, "value" => $value, "length" => string.length($value) ]);
+      }
+      $attValHash["value"] = $atts;
+      $attValHash["length"] = 1;
+      $attContainer["type"] = 48;
+      $attContainer["value"] = [ $attKeyHash, $attValHash ];
+      $attContainer["length"] = 1;
+      array.push($attrArray, $attContainer);
+   }
+   
+   $request = [];
+   array.push($request, $object);
+   array.push($request, [ "type" => 48, "length" => 1, "value" => $attrArray ] );
+   
+   $packet["request"] = $request;
+   $packet["length"] = 1;
+   return encodePacket($packet);
+   
+}
+
+# This function can be used to simply deny a search. If you've decided not to allow the
+# SearchRequest. You can send back a SearchDone response with an appropriate message.
+sub rejectSearch($messageID, $message) {  
+   $result = 53; # Unwilling to Perform the operation
+   sendLDAPResponse($messageID, 101, $result, "", $message, 0); 
+}
+
+# Wrapper for RejectBind. Sets the error code to 48 which is standard for rejecting
+# anonymous bind requests.
+sub RejectAnonBind($messageID) {
+   rejectBind($messageID, 48);  
+}
+
+# Reject a Bind request. The error should usually be one of the following:
+#  8 == StrongerAuthRequired, 
+#  48 == inappropriateAuthentication   (used to reject anonymous bind)
+#  49 == invalid Credentials
+sub RejectBind($messageID, $result) {
+   sendLDAPResponse($messageID, 97, $result, "", "", 0);
+}
+
+# Close the LDAP connection by sending a "Notice of disconnection". If you have decided you
+# don't like what the client is doing you can use this function to close the connection in 
+# accordance with the RFC. If it's a search you've chosen to deny you may want to use rejectSearch()
+# to deny the request without forcing the client to disconnect.
+sub close() {
+   
+   $result = 53; # Unwilling to Perform the operation
+   $error = "";  # Error Text. No value for this LDAP OID
+   $oid = "1.3.6.1.4.1.1466.20036"; # LDAP OID for Notice of Disconnection
+   $close = 1; # Close connection
+   $messageID = 0; # MessageID for Notice of Disconnection is always 0
+   $operation = 120; # ExtendedResponse
+   
+   sendLDAPResponse($messageID, $operation, $result, $oid, $error, $close);
+   
+}
+
+# Function to send a LDAP Response message. This is used for both the startTLS
+# response message, the Notice of Disconnection, etc, etc
+sub sendLDAPResponse($messageID, $operation, $result, $oid, $error, $close) {
+   
+   $lov = ber.encode(4, $error); # Error Text.  
+   $lon = ber.encode(4, $oid); # Octet String LDAPOID
+   $rc = ber.encode(10, $result); # This is our result code
+   $er = ber.encode($operation, $rc . $lon . $lov); # Combine the above into the LDAP message
+   $mid = ber.encode(2, $messageID); # Message ID.
+   $seq = ber.encode(48, $mid . $er); # Put the Sequence together: Message ID, LDAP Message.
+   
+   if ( $close ) {
+      connection.close($seq);
+   } else {
+      request.sendResponse($seq);
+   }
+   
+}

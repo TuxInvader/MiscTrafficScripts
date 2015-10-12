@@ -1,0 +1,41 @@
+#=-Replace images with pictures of kittens
+import libImage as img;
+
+$site = "http://placekitten.com/";
+#$site = "http://lorempixel.com/";
+
+##################################################################################
+# Main code block starts here....                                                #
+#                                                                                #
+# First check the Content-Type is an image format                                #
+##################################################################################
+
+$ct = http.getResponseHeader("Content-Type");
+if ( string.regexmatch($ct, "image/([^\\s]+).*" ) ) {
+   $img = $1;
+} else {
+   break;
+}
+
+# Parse the image with the appropriate sub function
+if ( $img == "jpg" || $img == "jpeg" ) {
+   $dimensions = img.processJPEG();
+} else if ( $img == "png" ) {
+   $dimensions = img.processPNG();
+} else if ( $img == "gif" ) {
+   $dimensions = img.processGIF();
+}
+
+if ( ! lang.isArray($dimensions) ) {
+   #Something went wrong processing the image :-(
+   break;
+}
+
+# Replace the image data with our kitten
+$image = http.request.get( $site . $dimensions[0] . "/" . $dimensions[1]);
+if ( $1 == "200" ) {
+   http.setResponseHeader("Content-Type", "image/jpeg");
+   http.setResponseBody($image);
+   log.info( "Replacing: " . http.getPath() . ". Sending alternative with dimensions: " . lang.dump($dimensions) );
+}
+

@@ -1,0 +1,102 @@
+# return the dimensions of a JPEG file. Returns null if parsing fails
+sub processJPEG() {
+   
+   $JPEG_HEADER = string.hexdecode("FFD8");
+   $FF = string.hexdecode("FF");
+   
+   # Get the body
+   $data = http.getResponseBody();
+
+   # Check to see if the file really is a JPEG (atleast if it has a JPEG header)
+   $header = string.subString($data, 0,1);
+   if ( $header != $JPEG_HEADER ) {
+      log.warn("Not a JPEG");
+      return;
+   }
+   
+   # Parse each chunk until we find the dimensions
+   $off = 2;
+   while ( ! $dim ) {
+      
+      # Find the FF indicating the start of the marker
+      while ( string.subString($data, $off, $off) != $FF ) {
+         $off++;
+      }
+      
+      # FF can be used as padding, so skip any extras.
+      while ( string.subString($data, $off, $off) == $FF ) {
+         $off++;
+      }
+      
+      # The next byte after FF is the marker code
+      $code = string.hexEncode(string.subString($data, $off, $off++));
+      # followed by the length of the segment (including the length bytes).
+      $length = string.subString($data, $off, $off + 1);
+      $length = string.bytesToInt($length);
+      
+      # The dimensions are held in a SOFn chunk, we're only interested in these.
+      if ( string.regexmatch($code, "C[012356789ABDEF]" ) ) {
+         $height = string.bytesToInt(string.subString($data,$off+3, $off+4));
+         $width = string.bytesToInt(string.subString($data,$off+5, $off+6));
+         return [ $width, $height ];
+      }
+      
+      # Not a SOFn so skip the chunk
+      $off += $length;
+   }    
+}
+
+# return the dimensions of a PNG file. Returns null if parsing fails
+sub processPNG() {
+   
+   $PNG_HEADER = string.hexdecode("89504E470D0A1A0A");
+   
+   # Get the response body
+   $data = http.getResponseBody();
+   
+   # Check the file really is a PNG
+   $header = string.subString($data, 0,7);
+   if ( $header != $PNG_HEADER ) {
+      log.warn("Not a PNG");
+      return;
+   }
+   
+   # First chunk MUST be IHDR and MUST contain the dimensions
+   $length = string.subString($data, 8,11);
+   $type = string.subString($data, 12,15);
+   
+   # This PNG is broken - Don't process any further
+   if ( $type != "IHDR" ) {
+      log.warn("PNG is invalid");
+      return;
+   }
+   
+   # The next bytes contain the width and height
+   $width = string.bytesToInt( string.subString($data, 16,19) );
+   $height = string.bytesToInt( string.subString($data, 20,23) );
+   
+   return [ $width, $height ];
+}
+
+sub processGIF() {
+   
+   $GIF87_HEADER = string.hexdecode("474946383761");
+   $GIF89_HEADER = string.hexdecode("474946383961");
+   
+   # Get the response body
+   $data = http.getResponseBody();
+   
+   # Check the file really is a GIF
+   $header = string.subString($data, 0,5);
+   if ( ( $header != $GIF87_HEADER) && ( $header != $GIF89_HEADER) ) {
+      log.warn("Not a GIF");
+      return;
+   }
+   
+   # The next bytes contain the width and height
+   $width = string.bytesToInt( string.reverse( string.subString($data, 6,7) ) );
+   $height = string.bytesToInt( string.reverse( string.subString($data, 8,9) ) );
+   
+   return [ $width, $height ];
+   
+}
