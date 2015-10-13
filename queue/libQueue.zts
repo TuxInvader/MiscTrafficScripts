@@ -57,7 +57,7 @@ sub init($config, $houseKeeping, $counters) {
    
    # Insert uncacheable gif when ever we issue a cookie? Ensure that users switch from initial to
    # active sessions.
-   $config["insertGif"] = true;
+   $config["insertGif"] = false;
 
    #==============================================================================
    # All of the HousKeeping Settings below are applied by each child for each pool
