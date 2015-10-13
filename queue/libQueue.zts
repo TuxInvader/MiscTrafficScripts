@@ -22,10 +22,10 @@ sub init($config, $houseKeeping, $counters) {
 
    # Initial Session Timeout in seconds - limit possibility of DoS by setting the initial session timeout low.
    # We switch to the normal session timeout once a session has been reused.
-   $config["initialTimeout"] = 60;
+   $config["initialTimeout"] = 10;
 
    # Session idle timeout in seconds.
-   $config["sessionTimeout"] = 120;
+   $config["sessionTimeout"] = 300;
 
    # Waiting Room idle Timeout
    $config["waitingRoomTimeout"] = 60;
@@ -54,6 +54,10 @@ sub init($config, $houseKeeping, $counters) {
 
    # Child processes (cores) expected. Used by watchdog to detect dead children
    $config["childprocs"] = 2;
+   
+   # Insert uncacheable gif when ever we issue a cookie? Ensure that users switch from initial to
+   # active sessions.
+   $config["insertGif"] = true;
 
    #==============================================================================
    # All of the HousKeeping Settings below are applied by each child for each pool
@@ -301,13 +305,13 @@ sub houseKeeping($mypid, $config, $houseKeeping, $counters) {
       # Perform housekeeping
       debug(2,"houseKeeping: Processing ".$config["poolName"].": Old Count: " . array.length($sessionsApplication));
       debug(3, "houseKeeping: ".$config["poolName"]." Sessions: " . lang.dump($sessionsApplication)  );  
-      $sessionsApplication = doHouseKeeping($mypid, $sessionsApplication, $houseKeeping, $config, $counters["sessionExpire"]);
+      $sessionsApplication = doHouseKeeping($mypid, $sessionsApplication, $houseKeeping, $config, "Application", $counters["sessionExpire"]);
       data.local.set("mySessions.".$config["poolName"], array.join($sessionsApplication,",") );
       debug(2, "houseKeeping: ".$config["poolName"]." processed. New Count: " . array.length($sessionsApplication) ); 
       # Now process WaitingRoom
       debug(2,"houseKeeping: Processing ".$config["queueName"].": Old Count: " . array.length($sessionsWaiting));
       debug(3, "houseKeeping: ".$config["queueName"]." Sessions: " . lang.dump($sessionsWaiting)  );  
-      $sessionsWaiting = doHouseKeeping($mypid, $sessionsWaiting, $houseKeeping, $config, $counters["waitingRoomExpire"]);
+      $sessionsWaiting = doHouseKeeping($mypid, $sessionsWaiting, $houseKeeping, $config, "WaitingRoom", $counters["waitingRoomExpire"]);
       data.local.set("mySessions.".$config["queueName"], array.join($sessionsWaiting,",") );
       data.local.set("HKR.".$config["queueName"], sys.time() );
       debug(2, "houseKeeping: ".$config["queueName"]." processed. New Count: " . array.length($sessionsWaiting) ); 
@@ -334,7 +338,7 @@ sub houseKeeping($mypid, $config, $houseKeeping, $counters) {
 }
  
 # The housekeeping function has determined housekeeping is necessary. So do it!
-sub doHouseKeeping($mypid, $sessions, $houseKeeping, $config, $expireCounter) {
+sub doHouseKeeping($mypid, $sessions, $houseKeeping, $config, $pool, $expireCounter) {
  
    $newSessions = [];
    $processed = 0;
@@ -396,7 +400,7 @@ sub doHouseKeeping($mypid, $sessions, $houseKeeping, $config, $expireCounter) {
    }
  
    if ( array.length($sessions) == 0 ) {
-      debug(4,"doHouseKeeping: Processed: ". array.length($newSessions) . ", deleted: ". $deleted );
+      debug(4,"doHouseKeeping: Kept: ". array.length($newSessions) . ", deleted: ". $deleted );
       data.local.set("houseKeeping.".$pool."offSet", 0);
       if ( $wrRun ) {
          if ( array.length($newSessions) > 0 ) {
@@ -414,8 +418,8 @@ sub doHouseKeeping($mypid, $sessions, $houseKeeping, $config, $expireCounter) {
       }
 
    } else {
-      debug(4,"doHouseKeeping: Processed: ". array.length($newSessions) . ", deleted: ". $deleted );
-      data.local.set("houseKeeping.".$pool."offSet", array.length($newSessions)-$deleted );
+      debug(4,"doHouseKeeping: Kept: ". array.length($newSessions) . ", deleted: ". $deleted );
+      data.local.set("houseKeeping.".$pool."offSet", array.length($newSessions));
    }
    
    array.append($newSessions, $sessions);
@@ -454,26 +458,40 @@ sub issueCookie($mypid, $config, $pool) {
   
    # Encrypt and set the response cookie
    $cookieCrypted = string.encrypt( $cookieString, $config["cookieSecret"] );  
-   http.setResponseCookie($config["cookieName"], $cookieCrypted, "path=/; HttpOnly");
-   connection.data.set("cookieHeader", "Set-Cookie: ". $config["cookieName"] . "=" . $cookieCrypted ."; path=/; HttpOnly\r\n" );
+   http.setResponseCookie($config["cookieName"], $cookieCrypted, "path=/;");
+   connection.data.set("cookieHeader", "Set-Cookie: ". $config["cookieName"] . "=" . $cookieCrypted ."; path=/;\r\n" );
+   
+   # Flag for gif insertion if necessary
+   if ( $config["insertGif"] ) {
+      connection.data.set("insertGif", true);
+   }
   
    debug(2, "issueCookie: Session: " . lang.dump($cookieArray));
    return $cookieArray;
 }
 
 # update the cookie for the user
-sub updateCookie($config, $cookieArray) {
+sub updateCookie($config, $cookieArray, $force) {
    
    if ( $cookieArray[3] == $config["poolName"] ) {
       $timeout = sys.time() + $config["sessionTimeout"];
+      $refresh = $config["sessionTimeout"] / 2;
    } else {
       $timeout = sys.time() + $config["waitingRoomTimeout"];
+      $refresh = $config["waitingRoomTimeout"] / 2;
    }
    
+   # Only issue a new cookie if we are half way through the timeout, unless forced.
+   if (  ( (sys.time() + $refresh) <=  $cookieArray[1] ) && $force == false ) {
+      debug(3, "updateCookie: Internal: " . $cookieArray[0]);
+      data.set("Session.".$cookieArray[0], $timeout );
+      return;
+   }
+     
    $cookieArray[1] = $timeout;
    $cookieString = array.join($cookieArray);
-  
-   debug(3, "updateCookie: Session: " . lang.dump($cookieArray));
+   
+   debug(3, "updateCookie: Set-Cookie: " . lang.dump($cookieArray));
   
    # Check to see if the session exists in memory... If not add it and take responsibility for housekeeping
    $session = data.get("Session.".$cookieArray[0]);
@@ -499,8 +517,8 @@ sub updateCookie($config, $cookieArray) {
    data.set("Session.".$cookieArray[0], $timeout );
   
    $cookieCrypted = string.encrypt( $cookieString, $config["cookieSecret"] );  
-   http.setResponseCookie($config["cookieName"], $cookieCrypted, "path=/; HttpOnly");
-   connection.data.set("cookieHeader", "Set-Cookie: ". $config["cookieName"] . "=" . $cookieCrypted ."; path=/; HttpOnly\r\n" );
+   http.setResponseCookie($config["cookieName"], $cookieCrypted, "path=/;");
+   connection.data.set("cookieHeader", "Set-Cookie: ". $config["cookieName"] . "=" . $cookieCrypted ."; path=/;\r\n" );
 }
 
 # Check session is still valid, return CookieArray or empty string if invalid
@@ -508,15 +526,28 @@ sub checkCookie($config) {
    $time = sys.time();
    $ip = request.getRemoteIP();
    $cookie = http.getCookie($config["cookieName"]);
+   debug(3, "checkCookie: Cookie: " . $cookie );
    $cookieString = string.decrypt($cookie, $config["cookieSecret"]);
+   if ( $cookieString == "" ) {
+      debug(0, "Cookie decrypt failed. Possible session tampering from: " . request.getRemoteIP());
+      return "";
+   }
    $cookieArray = string.split($cookieString);
   
    debug(3, "checkCookie: Session: " . lang.dump($cookieArray));
-  
-   if ( $cookieArray[1] < $time ) {
-      debug(2, "checkCookie: Session Expired: " . $cookieArray[0] );
-      return "";
+   
+   # Use our stored timeout in preference to the users cookie.
+   $knownTO = data.get("Session.".$cookieArray[0]);
+   if ( $knownTO ) {
+      if ( $knownTO < $time) {
+         debug(2, "checkCookie: Session Expired: " . $cookieArray[0] );
+         return "";
+      }
+   } else if ( $cookieArray[1] < $time ) {
+     debug(2, "checkCookie: Session Expired: " . $cookieArray[0] );
+     return "";
    }
+   
    if ( $cookieArray[2] != $ip ) {
       debug(2, "checkCookie: Session IP Changed: " . $cookieArray[0] );
       return "";
@@ -529,8 +560,8 @@ sub checkCookie($config) {
 sub removeCookie($config, $counters, $cookieArray) {
    $time = sys.time() - 1;
    data.set("Session.".$cookieArray[0], $time );
-   http.setResponseCookie($config["cookieName"],"expired","path=/; expires=Thu, Jan 01 1970 00:00:00 UTC; HttpOnly");
-   connection.data.set("cookieHeader", "Set-Cookie: ". $config["cookieName"] . "=expired; path=/; expires=Thu, Jan 01 1970 00:00:00 UTC; HttpOnly\r\n" );
+   http.setResponseCookie($config["cookieName"],"expired","path=/; expires=Thu, Jan 01 1970 00:00:00 UTC;");
+   connection.data.set("cookieHeader", "Set-Cookie: ". $config["cookieName"] . "=expired; path=/; expires=Thu, Jan 01 1970 00:00:00 UTC;\r\n" );
    debug(3, "removeCookie: Session Finished: ". $cookieArray[0]);
    counter64.increment($counters["sessionComplete"]);
 }
@@ -632,7 +663,7 @@ sub do_req($config,$houseKeeping,$counters) {
          if ( $config["invalidSessionPage"] != "" ) {
             debug(3, "do_req: User has invalid or expired session. Returning invalid session page.");
             returnPage("200 OK", $config["invalidSessionPage"], "Set-Cookie: ". $config["cookieName"] .
-                    "=expired; path=/; expires=Thu, Jan 01 1970 00:00:00 UTC; HttpOnly", "");  
+                    "=expired; path=/; expires=Thu, Jan 01 1970 00:00:00 UTC;", "");  
          } else {
             debug(3, "do_req: User has invalid or expired session. Ignored.");
             $pool = "";
@@ -652,9 +683,9 @@ sub do_req($config,$houseKeeping,$counters) {
       
          # Update the cookie if the timeout is soon (ie timeout <= sessionTimeoutInit)
          $initTimeOut = sys.time() + $config["initialTimeout"];
-         if ( $cookieArray[1] <= $initTimeOut ) {
+         if ( data.get("Session.".$cookieArray[0]) <= $initTimeOut ) {
             debug(3, "do_req: User Cookie close to timeout - updating with sessionTimeout");
-            updateCookie($config, $cookieArray);
+            updateCookie($config, $cookieArray, true);
          }
      
          # finish rule here
@@ -669,7 +700,7 @@ sub do_req($config,$houseKeeping,$counters) {
       bouncer($mypid, $pidlist, $config, $counters);
    
       # update cookie
-      updateCookie($config, $cookieArray);
+      updateCookie($config, $cookieArray, false);
       counter64.increment($counters["sessionUpdate"]);
    
       # Process users in WaitingRoom
@@ -687,7 +718,7 @@ sub do_req($config,$houseKeeping,$counters) {
             debug(2, "do_req: ".$config["queueName"]." Session Migrated: ". $userSession .", IssuingTime: ". $issuingTime .", QueuePos:". $queuePos);
             $cookieArray[3] = $config["poolName"];
             $pool = $config["poolName"];
-            updateCookie($config, $cookieArray);
+            updateCookie($config, $cookieArray, false);
          } else {
             debug(3, "do_req: ".$config["queueName"]." Session still WAITING: ". $userSession);
             waitingRoom($mypid, $config, $pidlist, $cookieArray, false);
@@ -727,3 +758,4 @@ sub do_req($config,$houseKeeping,$counters) {
  
    }
 }
+

@@ -1,0 +1,8 @@
+#=-Only needed if insertGif is true
+$insert = connection.data.get("insertGif");
+if ( $insert ) {
+   log.warn("Insert");
+   $body = http.getResponseBody();
+   $body = string.regexsub($body, "(<body[^>]*>)", "$1\n<img style=\"display:none\" src=\"/_vTMQueue.gif?time=" . sys.time() . "\">");
+   http.setResponseBody($body);
+}
