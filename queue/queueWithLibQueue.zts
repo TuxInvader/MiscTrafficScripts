@@ -9,15 +9,16 @@ queue.init($config, $houseKeeping, $counters);
 
 # =====================================================================
 # == Configuration Overrides for this host 
-$config["poolName"] = "Rainbow";
-$config["queueName"] = "RainbowQueue";
+$config["childprocs"] = 2;
+$config["poolName"] = "DemoApp";
+$config["queueName"] = "DemoQueue";
 $config["waitingRoomTemplatePage"] = "waitingroom.html";
 $config["waitingRoomTooBusyPage"] = "toobusy.html";
 # =====================================================================
 
 $pool = queue.do_req($config,$houseKeeping,$counters);
 if ($pool == $config["poolName"] ) {
-   pool.use("www.demo.local");
+   pool.use("DemoApp");
 } else {
    pool.use("WaitingRoom");
 }

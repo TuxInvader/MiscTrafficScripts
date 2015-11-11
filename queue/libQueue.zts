@@ -31,10 +31,10 @@ sub init($config, $houseKeeping, $counters) {
    $config["waitingRoomTimeout"] = 60;
 
    # Busy Session limit for Application
-   $config["sessionLimit"] = 10;
+   $config["sessionLimit"] = 30;
 
    # Max Waiting Room Queue Length
-   $config["waitingRoomLimit"] = 20;
+   $config["waitingRoomLimit"] = 50;
 
    # Does vTM manage the WaitingRoom or do we use a server pool?
    $config["waitingRoomUsesPool"] = false;
@@ -68,13 +68,13 @@ sub init($config, $houseKeeping, $counters) {
    #==============================================================================
  
    # Maximum sessions to check during a house keeping run
-   $houseKeeping["Max"] = 3;
+   $houseKeeping["Max"] = 200;
  
    # House keeping frequency (every n requests) when load is below the busy threshold.
    $houseKeeping["Freq"] = 10;
  
    # Busy threshold for house keeping - below this we only do housekeeeping every $houseKeeping["Freq"] requests.
-   $houseKeeping["Busy"] = 3;
+   $houseKeeping["Busy"] = 50;
  
    #==============================================================================
    # User 64bit Counters
@@ -105,7 +105,7 @@ sub init($config, $houseKeeping, $counters) {
 sub debug($level, $string) {
   
    # SET THE DEBUG LEVEL HERE!!
-   $debug = 4;
+   $debug = 5;
   
    if ( $level == 0 ) {
       log.warn("ERR: " . sys.getPid() . " " . $level . "-> " . $string);
@@ -305,13 +305,13 @@ sub houseKeeping($mypid, $config, $houseKeeping, $counters) {
       # Perform housekeeping
       debug(2,"houseKeeping: Processing ".$config["poolName"].": Old Count: " . array.length($sessionsApplication));
       debug(3, "houseKeeping: ".$config["poolName"]." Sessions: " . lang.dump($sessionsApplication)  );  
-      $sessionsApplication = doHouseKeeping($mypid, $sessionsApplication, $houseKeeping, $config, "Application", $counters["sessionExpire"]);
+      $sessionsApplication = doHouseKeeping($mypid, $sessionsApplication, $houseKeeping, $config, $config["poolName"], $counters["sessionExpire"]);
       data.local.set("mySessions.".$config["poolName"], array.join($sessionsApplication,",") );
       debug(2, "houseKeeping: ".$config["poolName"]." processed. New Count: " . array.length($sessionsApplication) ); 
       # Now process WaitingRoom
       debug(2,"houseKeeping: Processing ".$config["queueName"].": Old Count: " . array.length($sessionsWaiting));
       debug(3, "houseKeeping: ".$config["queueName"]." Sessions: " . lang.dump($sessionsWaiting)  );  
-      $sessionsWaiting = doHouseKeeping($mypid, $sessionsWaiting, $houseKeeping, $config, "WaitingRoom", $counters["waitingRoomExpire"]);
+      $sessionsWaiting = doHouseKeeping($mypid, $sessionsWaiting, $houseKeeping, $config, $config["queueName"], $counters["waitingRoomExpire"]);
       data.local.set("mySessions.".$config["queueName"], array.join($sessionsWaiting,",") );
       data.local.set("HKR.".$config["queueName"], sys.time() );
       debug(2, "houseKeeping: ".$config["queueName"]." processed. New Count: " . array.length($sessionsWaiting) ); 
@@ -344,6 +344,7 @@ sub doHouseKeeping($mypid, $sessions, $houseKeeping, $config, $pool, $expireCoun
    $processed = 0;
    $time = sys.time();
    
+   # If we are inserting the Queuing information (ie not relying on a backend server), then update the queue info.
    if ( $pool == $config["queueName"] && ( $config["waitingRoomUsesPool"] == false ) ) {
       $wrRun = sprintf("%f", sys.time.highres());
       data.set($config["queueName"].".". $mypid .".DeQueued.". $wrRun, 0);
@@ -377,6 +378,7 @@ sub doHouseKeeping($mypid, $sessions, $houseKeeping, $config, $pool, $expireCoun
             debug(3, "doHouseKeeping: Keeping Session: " . $session);
             array.push($newSessions , $session);
             if ( $wrRun ) {
+               debug(4, "doHouseKeeping: Updating wrRun counter: " . $session . ", Position: " . $position);
                $sq = string.split(data.get("SessionQueue.".$session), ",");
                $sq[2] = $wrRun;
                $sq[3] = ++$position;
@@ -607,21 +609,26 @@ sub waitingRoom($mypid, $config, $pidlist, $cookieArray, $new) {
       if ( $new ) {
          $position = array.length($sessionsWaiting);
          $queueID = $mypid;
+         debug(3, "waitingRoom: New Queued Session. QueueID: " . $queueID . ", Position: " . $position);
+         $sq = string.split(data.get("SessionQueue.".$session),",");
+         $sq[3] = $position; 
+         data.set("SessionQueue.".$session, array.join($sq,","));
       } else { 
          $sq = string.split(data.get("SessionQueue.".$session),",");
-         debug(4, "watingRoom: ".$config["queueName"]." Session: " . lang.dump($sq) );
+         debug(4, "waitingRoom: ".$config["queueName"]." Session: " . lang.dump($sq) );
          $wrQueues = string.split(data.get($config["queueName"].".". $sq[0] .".DeQueues"), ",");
          
          if ( $sq[3] == 0 ) {
+            debug(1, "waitingRoom: DEAD CODE - Shouldn't get here");
             $position = array.length($sessionsWaiting);
          } else {
             $deQueued = data.get($config["queueName"].".". $sq[0].".DeQueued.".$sq[2]);
             if ( $deQueued ) {
                $position = $sq[3] - $deQueued;
-               debug(3, "waitingRoom: Have WR Queue, Removed Sessions: " . $deQueued . ", Position: ". $position);
+               debug(3, "waitingRoom: HouseKeeping Update, Removed Sessions: " . $deQueued . ", Position: ". $position);
             } else {
                $position = $sq[3];
-               debug(3, "waitingRoom: NO WR Queue, Position: " . $position);
+               debug(3, "waitingRoom: Position: " . $position);
             }
          }
          $queueID = $sq[0];
